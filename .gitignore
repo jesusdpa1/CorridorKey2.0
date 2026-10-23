@@ -38,6 +38,7 @@ tmp/
 path_mappings.json
 .claude/
 .knowledge/
+data/
 
 # Rust
 target/
