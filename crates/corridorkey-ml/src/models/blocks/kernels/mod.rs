@@ -24,7 +24,7 @@ pub use attn_3d::{
 pub use depthwise::{boundary_coord, depthwise_conv2d_nhwc_kernel, depthwise_swiglu_2d_kernel};
 pub use norm::rms_norm_kernel;
 pub use patch::{add_gated_rgb_skip_kernel, col2im_nhwc_kernel, im2col_nhwc_kernel};
-pub use sdpa::{SDPA_KEY_TILE, SDPA_MAX_HEAD_DIM, launch_sdpa_window, sdpa_window_kernel};
+pub use sdpa::{SDPA_K_TILE, SDPA_MAX_HEAD_DIM, launch_sdpa_window, sdpa_window_kernel};
 pub use swiglu::{
     add_row_bias_kernel, add_row_bias_residual_kernel, silu, swiglu_gate_fused_kernel,
     swiglu_gate_kernel,

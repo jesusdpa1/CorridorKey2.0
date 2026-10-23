@@ -115,14 +115,13 @@ fn compare_stage2_with_python() {
                 bias_done,
             );
             let sdpa_ms = step_ms(&mut || {
-                let y = burn_tensor::module::attention(
+                let y = corridorkey_ml::models::blocks::attn_core::run_unmasked_sdpa::<f32>(
+                    &ctx,
                     q.clone(),
                     k.clone(),
                     v.clone(),
-                    None,
-                    None,
-                    burn_tensor::ops::AttentionModuleOptions::default(),
-                );
+                )
+                .unwrap();
                 let _ = corridorkey_ml::into_contiguous_cube(y).unwrap();
             });
             let attn_ms = step_ms(&mut || {

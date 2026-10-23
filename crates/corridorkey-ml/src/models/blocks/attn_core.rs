@@ -291,12 +291,12 @@ impl AttentionCore {
     }
 }
 
-type DeviceRegionTables = Arc<Mutex<Option<(Handle, Handle, Handle)>>>;
+type DeviceRegionTables = Arc<Mutex<Option<Handle>>>;
 
 /// Precomputed shifted-window region groups matching `_shifted_region_groups_2d_cached` and
 /// `_shifted_region_groups_3d_cached` in `corridorkey/blocks.py`.
 ///
-/// Precomputes compact CSR-style key lookup tables (`q_offsets`, `q_lens`, `k_table`) so
+/// Precomputes compact per-token region ID tables (`region_ids: [num_windows * n_tokens]`) so
 /// [`sdpa_window_kernel`](crate::models::blocks::kernels::sdpa_window_kernel) executes all
 /// full, partial, and padded windows in a single kernel launch.
 #[derive(Clone, Debug)]
@@ -304,10 +304,8 @@ pub struct ShiftedRegionGroups {
     pub num_windows: usize,
     pub full_windows: Vec<u32>,
     pub partial_groups: Vec<(Vec<u32>, Vec<u32>)>,
-    pub q_offsets: Vec<u32>,
-    pub q_lens: Vec<u32>,
-    pub k_table: Vec<u32>,
-    device_tables: DeviceRegionTables,
+    pub region_ids: Vec<i32>,
+    device_table: DeviceRegionTables,
 }
 
 impl ShiftedRegionGroups {
@@ -371,9 +369,7 @@ impl ShiftedRegionGroups {
 
         let mut full_windows = Vec::new();
         let mut groups_map: BTreeMap<Vec<u32>, Vec<u32>> = BTreeMap::new();
-        let mut q_offsets = vec![0u32; num_windows * n_tokens];
-        let mut q_lens = vec![0u32; num_windows * n_tokens];
-        let mut k_table = Vec::with_capacity(num_windows * n_tokens);
+        let mut region_ids = vec![-1i32; num_windows * n_tokens];
 
         for wy in 0..nh {
             for wx in 0..nw {
@@ -386,17 +382,18 @@ impl ShiftedRegionGroups {
                         win_labels.push(region_grid[py * wp + px]);
                     }
                 }
+
+                for ti in 0..t {
+                    for si in 0..spatial_tokens {
+                        let tok = ti * spatial_tokens + si;
+                        region_ids[win_idx * n_tokens + tok] = win_labels[si] as i32;
+                    }
+                }
+
                 let first = win_labels[0];
                 let is_full = first >= 0 && win_labels.iter().all(|&l| l == first);
                 if is_full {
                     full_windows.push(win_idx as u32);
-                    let off = k_table.len() as u32;
-                    for tok in 0..n_tokens {
-                        k_table.push(tok as u32);
-                        let meta_idx = win_idx * n_tokens + tok;
-                        q_offsets[meta_idx] = off;
-                        q_lens[meta_idx] = n_tokens as u32;
-                    }
                 } else {
                     let mut unique_labels: Vec<i16> =
                         win_labels.iter().copied().filter(|&l| l >= 0).collect();
@@ -415,14 +412,6 @@ impl ShiftedRegionGroups {
                                     tok_tuple.push((ti * spatial_tokens + si) as u32);
                                 }
                             }
-                            let off = k_table.len() as u32;
-                            let len = tok_tuple.len() as u32;
-                            k_table.extend_from_slice(&tok_tuple);
-                            for &tok in &tok_tuple {
-                                let meta_idx = win_idx * n_tokens + (tok as usize);
-                                q_offsets[meta_idx] = off;
-                                q_lens[meta_idx] = len;
-                            }
                             groups_map.entry(tok_tuple).or_default().push(win_idx as u32);
                         }
                     }
@@ -430,34 +419,24 @@ impl ShiftedRegionGroups {
             }
         }
 
-        if k_table.is_empty() {
-            k_table.push(0);
-        }
-
         let partial_groups = groups_map.into_iter().collect();
         Self {
             num_windows,
             full_windows,
             partial_groups,
-            q_offsets,
-            q_lens,
-            k_table,
-            device_tables: Arc::new(Mutex::new(None)),
+            region_ids,
+            device_table: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn get_or_upload_tables(&self, ctx: &MlContext) -> (Handle, Handle, Handle) {
-        let mut guard = self.device_tables.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(handles) = &*guard {
-            return handles.clone();
+    fn get_or_upload_table(&self, ctx: &MlContext) -> Handle {
+        let mut guard = self.device_table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = &*guard {
+            return h.clone();
         }
-        let handles = (
-            upload(ctx.client(), &self.q_offsets),
-            upload(ctx.client(), &self.q_lens),
-            upload(ctx.client(), &self.k_table),
-        );
-        *guard = Some(handles.clone());
-        handles
+        let h = upload(ctx.client(), &self.region_ids);
+        *guard = Some(h.clone());
+        h
     }
 
     /// Executes SDPA with shifted-window region isolation in a single fused CubeCL kernel launch,
@@ -476,19 +455,13 @@ impl ShiftedRegionGroups {
         let c_q = into_contiguous_cube(q)?;
         let c_k = into_contiguous_cube(k)?;
         let c_v = into_contiguous_cube(v)?;
-        let (q_off_h, q_len_h, k_tab_h) = self.get_or_upload_tables(ctx);
+        let reg_h = self.get_or_upload_table(ctx);
         let out_handle = launch_sdpa_window::<F>(
             ctx.client(),
             c_q.handle,
             c_k.handle,
             c_v.handle,
-            Some((
-                &q_off_h,
-                &q_len_h,
-                &k_tab_h,
-                self.num_windows,
-                self.k_table.len(),
-            )),
+            Some((&reg_h, self.num_windows)),
             total_wins,
             num_heads,
             n_tokens,
