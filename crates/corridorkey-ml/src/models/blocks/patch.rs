@@ -266,7 +266,7 @@ impl PatchifyConv {
         }
 
         let cols_2d = ctx.tensor_from_handle(cols_h, [tokens, k2_i], elem_dtype::<F>());
-        let out_2d = cols_2d.matmul(self.weight_k2io.clone());
+        let out_2d = ctx.matmul(cols_2d, self.weight_k2io.clone());
         let c_out = into_contiguous_cube(out_2d)?;
         let total_out = tokens * self.out_channels;
         let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
@@ -395,7 +395,7 @@ impl Depatchify {
         let k = self.overlap_mult * self.r;
         let k2_o = k * k * self.out_channels;
         let flat = x_nhwc.reshape([tokens, c_in]);
-        let cols_2d = flat.matmul(self.weight_ik2o.clone());
+        let cols_2d = ctx.matmul(flat, self.weight_ik2o.clone());
         let c_cols = into_contiguous_cube(cols_2d)?;
         if let Some(col_b) = &self.col_bias {
             let total_cols = tokens * k2_o;
@@ -670,7 +670,7 @@ impl GatedRgbSkip {
         let d_rgb = self.d - self.d_baton;
         let tokens = bt * h * w;
         let patch2 = self.patch_2.forward::<F>(ctx, rgb_nhwc)?;
-        let gate_logits = x_nhwc.clone().reshape([tokens, self.d]).matmul(self.gate_w_t.clone());
+        let gate_logits = ctx.matmul(x_nhwc.clone().reshape([tokens, self.d]), self.gate_w_t.clone());
 
         let c_x = into_contiguous_cube(x_nhwc)?;
         let c_p2 = into_contiguous_cube(patch2)?;

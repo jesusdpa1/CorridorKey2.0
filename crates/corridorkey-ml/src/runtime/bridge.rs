@@ -25,6 +25,7 @@ pub struct MlContext {
     cube_device: CubeDevice,
     client: Client,
     burn_device: BurnDevice,
+    flex32_matmul: bool,
 }
 
 impl std::fmt::Debug for MlContext {
@@ -47,7 +48,33 @@ impl MlContext {
             cube_device,
             client,
             burn_device,
+            flex32_matmul: false,
         })
+    }
+
+    /// Enables or disables accelerated `DType::Flex32` mode for GEMM operations on this context.
+    /// When enabled, `f32` inputs to `matmul` are staged to Tensor Cores (`Cmma`/`Mma`) on GPUs
+    /// where native FP32 tensor cores are absent (e.g. Turing `sm_75`, WebGPU).
+    pub fn with_flex32_matmul(mut self, enabled: bool) -> Self {
+        self.flex32_matmul = enabled;
+        self
+    }
+
+    /// Whether `DType::Flex32` accelerated matmul mode is enabled.
+    pub fn flex32_matmul(&self) -> bool {
+        self.flex32_matmul
+    }
+
+    /// Executes `a.matmul(b)` on this context, automatically staging operands to `DType::Flex32`
+    /// when `flex32_matmul` is active and operands are `f32`.
+    pub fn matmul<const D: usize>(&self, a: Tensor<D>, b: Tensor<D>) -> Tensor<D> {
+        if self.flex32_matmul && a.dtype() == DType::F32 && b.dtype() == DType::F32 {
+            let a_flex = a.cast(DType::Flex32);
+            let b_flex = b.cast(DType::Flex32);
+            a_flex.matmul(b_flex).cast(DType::F32)
+        } else {
+            a.matmul(b)
+        }
     }
 
     /// Context from `CORRIDORKEY_RUNTIME` or the first compiled-in runtime.
@@ -177,6 +204,24 @@ mod tests {
             assert_eq!(host.len(), 64);
             assert!((host[0] - 0.0).abs() < 1e-6);
             assert!(host[63] > 1.8);
+        }
+    }
+
+    #[test]
+    fn flex32_matmul_runs_and_preserves_accuracy() {
+        for target in ComputeTarget::available() {
+            let ctx = MlContext::new(target).unwrap().with_flex32_matmul(true);
+            let a_host = vec![1.0f32, 2.0, 3.0, 4.0];
+            let b_host = vec![0.5f32, 0.0, 0.0, 0.5];
+            let a = ctx.upload_tensor(&a_host, [2, 2]).unwrap();
+            let b = ctx.upload_tensor(&b_host, [2, 2]).unwrap();
+            let c = ctx.matmul(a, b);
+            let c_host: Vec<f32> = ctx.download_tensor(c).unwrap();
+            assert_eq!(c_host.len(), 4);
+            assert!((c_host[0] - 0.5).abs() < 1e-3);
+            assert!((c_host[1] - 1.0).abs() < 1e-3);
+            assert!((c_host[2] - 1.5).abs() < 1e-3);
+            assert!((c_host[3] - 2.0).abs() < 1e-3);
         }
     }
 }

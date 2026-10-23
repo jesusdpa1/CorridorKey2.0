@@ -324,7 +324,11 @@ pub fn launch_sdpa_window<F: CkFloat>(
     let out = empty::<F>(client, total_elems);
     let q_tiles_per_head = n_tokens.div_ceil(SDPA_Q_TILE as usize);
     let total_q_tiles = total_wins * num_heads * q_tiles_per_head;
-    let geom = LaunchGeometry::per_row(client, total_q_tiles, SDPA_TARGET_THREADS);
+    let hw = &client.properties().hardware;
+    let plane = LaunchGeometry::plane_lanes(client);
+    let target = (SDPA_TARGET_THREADS as u32).min(hw.max_units_per_cube).max(plane);
+    let units = 1 << (u32::BITS - 1 - target.leading_zeros());
+    let geom = LaunchGeometry::per_row(client, total_q_tiles, units as usize);
     let scale = cast::<F>(1.0 / (head_dim as f64).sqrt());
 
     let (reg_h, reg_len, num_windows, use_region) = match region_ids {

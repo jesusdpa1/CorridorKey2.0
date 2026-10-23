@@ -355,9 +355,7 @@ impl CSwinBlock3d {
             head_dim,
         )?;
 
-        let gate_logits = u1
-            .reshape([b * n_tokens, c])
-            .matmul(self.core.gate_w_t.clone());
+        let gate_logits = ctx.matmul(u1.reshape([b * n_tokens, c]), self.core.gate_w_t.clone());
         let c_gate = into_contiguous_cube(gate_logits)?;
 
         let total_elems = b * n_tokens * c;
@@ -382,7 +380,7 @@ impl CSwinBlock3d {
         }
 
         let merged_2d = ctx.tensor_from_handle(merged, [b * n_tokens, c], dt);
-        let proj_2d = merged_2d.matmul(self.core.proj_w_t.clone());
+        let proj_2d = ctx.matmul(merged_2d, self.core.proj_w_t.clone());
         let c_proj = into_contiguous_cube(proj_2d)?;
         unsafe {
             add_row_bias_kernel::launch::<F>(

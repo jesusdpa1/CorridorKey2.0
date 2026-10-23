@@ -132,7 +132,7 @@ impl SwiGlu {
         let num_rows = total_in / self.dim;
         let x2d: Tensor<2> = x.reshape([num_rows, self.dim]);
 
-        let gate_up_2d = x2d.matmul(self.w_gate_up_t.clone());
+        let gate_up_2d = ctx.matmul(x2d, self.w_gate_up_t.clone());
         let total_hidden = num_rows * self.hidden;
         let c_gate_up = into_contiguous_cube(gate_up_2d)?;
         let h_handle = empty::<F>(ctx.client(), total_hidden);
@@ -153,7 +153,7 @@ impl SwiGlu {
         }
 
         let h2d = ctx.tensor_from_handle(h_handle, [num_rows, self.hidden], elem_dtype::<F>());
-        let out2d = h2d.matmul(self.w_down_t.clone());
+        let out2d = ctx.matmul(h2d, self.w_down_t.clone());
         let c_out = into_contiguous_cube(out2d)?;
         Ok((shape, total_in, c_out.handle))
     }

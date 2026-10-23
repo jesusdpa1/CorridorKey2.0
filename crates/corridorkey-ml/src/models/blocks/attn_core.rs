@@ -178,7 +178,7 @@ impl AttentionCore {
         let [b, h, w, c] = x_nhwc.dims();
         let tokens = b * h * w;
         let c3 = 3 * self.dim;
-        let qkv_2d = x_nhwc.reshape([tokens, c]).matmul(self.qkv_w_t.clone());
+        let qkv_2d = ctx.matmul(x_nhwc.reshape([tokens, c]), self.qkv_w_t.clone());
         let qkv_4d = qkv_2d.reshape([b, h, w, c3]);
         if let Some(dw) = &self.qkv_dw {
             let filtered = dw.forward_with_in_bias::<F, 4>(ctx, qkv_4d, Some(&self.qkv_b))?;
@@ -253,7 +253,7 @@ impl AttentionCore {
     ) -> CkResult<Handle> {
         let total_tokens = batches * n_tokens;
         let total_elems = total_tokens * self.dim;
-        let gate_logits = gate_tokens_2d.matmul(self.gate_w_t.clone());
+        let gate_logits = ctx.matmul(gate_tokens_2d, self.gate_w_t.clone());
         let c_attn = into_contiguous_cube(attn)?;
         let c_gate = into_contiguous_cube(gate_logits)?;
         let merged = empty::<F>(ctx.client(), total_elems);
@@ -274,7 +274,7 @@ impl AttentionCore {
         }
         let merged_2d =
             ctx.tensor_from_handle(merged, [total_tokens, self.dim], elem_dtype::<F>());
-        let proj_2d = merged_2d.matmul(self.proj_w_t.clone());
+        let proj_2d = ctx.matmul(merged_2d, self.proj_w_t.clone());
         let c_proj = into_contiguous_cube(proj_2d)?;
         unsafe {
             add_row_bias_kernel::launch::<F>(

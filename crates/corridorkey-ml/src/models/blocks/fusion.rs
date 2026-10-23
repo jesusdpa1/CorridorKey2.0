@@ -109,7 +109,7 @@ impl AdaLnZero {
                 self.cond_dim
             )));
         }
-        let h_pre = cond_bt.matmul(self.in_proj_w_t.clone());
+        let h_pre = ctx.matmul(cond_bt, self.in_proj_w_t.clone());
         let c_h = into_contiguous_cube(h_pre)?;
         let total_h = bt * self.hidden;
         let act_h = empty::<F>(ctx.client(), total_h);
@@ -127,7 +127,7 @@ impl AdaLnZero {
             );
         }
         let act_2d = ctx.tensor_from_handle(act_h, [bt, self.hidden], elem_dtype::<F>());
-        let params_2d = act_2d.matmul(self.proj_w_t.clone());
+        let params_2d = ctx.matmul(act_2d, self.proj_w_t.clone());
         Ok(into_contiguous_cube(params_2d)?.handle)
     }
 
@@ -334,7 +334,7 @@ impl FusionLinSwiglu {
         let tokens: usize = x.dims()[..D - 1].iter().product();
 
         let x_2d = x.clone().reshape([tokens, self.in_dim]);
-        let shortcut_2d = x_2d.matmul(self.shortcut_w_t.clone());
+        let shortcut_2d = ctx.matmul(x_2d, self.shortcut_w_t.clone());
         let c_short = into_contiguous_cube(shortcut_2d)?;
         let total_out = tokens * self.out_dim;
         let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
@@ -351,8 +351,8 @@ impl FusionLinSwiglu {
         }
 
         let h_norm = self.norm.forward::<F, D>(ctx, x)?.reshape([tokens, self.in_dim]);
-        let gate_2d = h_norm.clone().matmul(self.gate_w_t.clone());
-        let up_2d = h_norm.matmul(self.up_w_t.clone());
+        let gate_2d = ctx.matmul(h_norm.clone(), self.gate_w_t.clone());
+        let up_2d = ctx.matmul(h_norm, self.up_w_t.clone());
         let c_gate = into_contiguous_cube(gate_2d)?;
         let c_up = into_contiguous_cube(up_2d)?;
 
@@ -376,7 +376,7 @@ impl FusionLinSwiglu {
 
         let gated_2d =
             ctx.tensor_from_handle(gated_h, [tokens, self.hidden], elem_dtype::<F>());
-        let nonlin_2d = gated_2d.matmul(self.down_w_t.clone());
+        let nonlin_2d = ctx.matmul(gated_2d, self.down_w_t.clone());
         let c_nonlin = into_contiguous_cube(nonlin_2d)?;
         unsafe {
             add_row_bias_kernel::launch::<F>(
