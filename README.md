@@ -21,23 +21,19 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
 environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
-This package was tested with:
+Exact versions are locked in `uv.lock` (torch 2.14.1, torchvision 0.29.1, CUDA 13.0).
+
+From the repository root, install the environment with [uv](https://docs.astral.sh/uv/)
+(PyTorch comes from the CUDA 13.0 index, see `pyproject.toml`) and download the model
+weights (about 5 GB):
 
 ```
-torch==2.9.1
-torchvision==0.24.1
+uv sync
+uv run scripts/download_weights.py
 ```
 
-From the repository root, create an environment, install PyTorch and the
-remaining dependencies, and download the model weights (about 5 GB):
-
-```
-python -m venv venv
-source venv/bin/activate
-pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-python scripts/download_weights.py
-```
+Then run the commands below with `uv run` (e.g. `uv run infer.py ...`), or activate
+`.venv` first.
 
 The download script fetches:
 
@@ -49,6 +45,23 @@ The download script fetches:
   (Microsoft), and RVM small (Google DeepMind)
 
 After that everything loads from those local folders.
+
+## Command Line (`corridorkey`)
+
+A Rust command line covers setup and runs, with typed, checked options
+(`cargo install --path crates/corridorkey-cli`, or `cargo run -p corridorkey-cli --`):
+
+```
+corridorkey doctor                      # GPU runtimes, assets, Python environment
+corridorkey weights download            # verified downloads (SHA-256 / MD5), skips files present
+corridorkey weights check [--hash]      # assets present, checkpoint header, optional checksums
+corridorkey infer -i clip.mp4 -o out --outputs alpha,fg,checker
+corridorkey interactive [clip.mp4]
+```
+
+Options use dashes (`--hann-chunk`, `--low-vram`); `corridorkey infer --help` lists
+them all. Inference still runs on the Python runtime (through `uv run`) until the
+Burn/CubeCL pipeline replaces it.
 
 ## Drag-And-Drop Launcher
 
