@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/corridorkey-core",
+    "crates/corridorkey-base",
+    "crates/corridorkey-ml",
+    "crates/corridorkey-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+corridorkey-core = { path = "crates/corridorkey-core" }
+corridorkey-base = { path = "crates/corridorkey-base" }
+corridorkey-ml = { path = "crates/corridorkey-ml" }
+
+# Compute & Tensors
+cubecl = { version = "0.11.0", default-features = false, features = ["std", "stdlib"] }
+burn-tensor = { version = "0.22.0", default-features = false, features = ["std", "autotune", "extension"] }
+burn-cubecl = { version = "0.22.0", default-features = false, features = ["std", "autotune"] }
+safetensors = "0.8.0"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+
+# CLI & assets
+clap = { version = "4.6.7", features = ["derive", "cargo", "env"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+sha2 = "0.10.9"
+md-5 = "0.10.6"
+base64 = "0.22.1"
+hex = "0.4.3"
+anyhow = "1.0.104"
+tracing-subscriber = "0.3.23"
+
+# Utilities
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+num-traits = "0.2.19"
+tracing = "0.1.44"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+
+# From dsp-kitchen: wgpu-core's lock tracing (debug assertions only) aborts at device shutdown, and
+# wgpu-types' debug assertions turn on the Vulkan validation layer (SIGABRT in the NVIDIA driver
+# at exit). Debug builds run wgpu like release ones; our own checks stay on.
+[profile.dev.package.wgpu-core]
+debug-assertions = false
+
+[profile.dev.package.wgpu-types]
+debug-assertions = false
