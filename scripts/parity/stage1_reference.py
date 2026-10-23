@@ -107,6 +107,32 @@ def main() -> None:
     rvm = torch.from_numpy(rvm_np).to(device) if rvm_dim > 0 else None
     hq = torch.from_numpy(hq_np).to(device)
 
+    # Register intermediate hooks to isolate layer-by-layer parity
+    intermediates = {}
+    def hook(name):
+        def fn(m, inp, out):
+            if isinstance(out, torch.Tensor):
+                intermediates[name] = out.detach().cpu()
+            elif isinstance(out, tuple) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+                intermediates[name] = out[0].detach().cpu()
+        return fn
+
+    model.stem.register_forward_hook(hook("stem"))
+    for i, blk in enumerate(model.enc_16):
+        blk.register_forward_hook(hook(f"enc_16_{i}"))
+    model.down.register_forward_hook(hook("down"))
+    if model.fuse is not None:
+        model.fuse.register_forward_hook(hook("fuse"))
+    for i, blk in enumerate(model.body_64):
+        blk.register_forward_hook(hook(f"body_64_{i}"))
+    model.mid_up.register_forward_hook(hook("mid_up"))
+    for i, blk in enumerate(model.mid_16):
+        blk.register_forward_hook(hook(f"mid_16_{i}"))
+    model.mid_down.register_forward_hook(hook("mid_down"))
+    model.up.register_forward_hook(hook("up"))
+    for i, blk in enumerate(model.dec_16):
+        blk.register_forward_hook(hook(f"dec_16_{i}"))
+
     with torch.no_grad():
         for _ in range(3):
             out = model(
@@ -152,6 +178,18 @@ def main() -> None:
     (out_dir / "hint_quality_bt.f32").write_bytes(hq_np.reshape(-1, 1).tobytes())
     (out_dir / "baton_bthwc_torch.f32").write_bytes(baton_bthwc.tobytes())
     (out_dir / "aux_bthwc_torch.f32").write_bytes(aux_bthwc.tobytes())
+
+    for k, tensor in intermediates.items():
+        arr = tensor.numpy()
+        # Convert to BTHWC if it's 5D (B, T, C, H, W) or 4D (BT, C, H, W) or (B, T, H, W, C)
+        if arr.ndim == 5:
+            # Check if channels are at dim 2 (B, T, C, H, W) or dim 4 (B, T, H, W, C)
+            if arr.shape[2] in (cfg["d_16"], cfg["d_64"], cfg.get("d_down_aux", 256)):
+                arr = arr.transpose(0, 1, 3, 4, 2)
+        elif arr.ndim == 4:
+            # (BT, C, H, W) -> (B, T, H, W, C)
+            arr = arr.reshape(b, t, arr.shape[1], arr.shape[2], arr.shape[3]).transpose(0, 1, 3, 4, 2)
+        (out_dir / f"{k}_bthwc.f32").write_bytes(arr.astype(np.float32).tobytes())
 
     summary = {
         "device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
