@@ -89,6 +89,11 @@ fn test_stage1_layer_by_layer() {
     let vfm_64 = read_f32_file(&dir.join("vfm_64_bthwc.f32"));
     let t_vfm = ctx.upload_tensor(&vfm_64, [b, t, h64, w64, meta.vfm_channels]).unwrap();
     let combined = burn_tensor::Tensor::cat(vec![t_vfm, f_64_down.reshape([b, t, h64, w64, stage1.d_16])], 4);
+    let got_combined = ctx.download_tensor::<f32, 5>(combined.clone()).unwrap();
+    let want_tokens = read_f32_file(&dir.join("fuse_tokens_bthwc.f32"));
+    let (mean_tok, max_tok) = diff_stats(&got_combined, &want_tokens);
+    println!("Tokens: mean={mean_tok:.3e}, max={max_tok:.3e}");
+
     let mut f_64 = if let Some(fuse) = &stage1.fuse {
         let f = fuse.forward::<f32, 5>(&ctx, combined).unwrap();
         let got_fuse = ctx.download_tensor::<f32, 5>(f.clone()).unwrap();
