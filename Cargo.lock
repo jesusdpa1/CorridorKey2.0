@@ -1061,6 +1061,7 @@ dependencies = [
  "clap",
  "corridorkey-base",
  "corridorkey-core",
+ "corridorkey-ml",
  "cubecl",
  "hex",
  "md-5",

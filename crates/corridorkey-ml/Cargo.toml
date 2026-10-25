@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "cuda"]
 wgpu = ["burn-tensor/wgpu", "burn-cubecl/wgpu", "corridorkey-base/wgpu"]
 cpu = ["burn-tensor/cpu", "burn-cubecl/cpu", "corridorkey-base/cpu"]
 cuda = ["burn-tensor/cuda", "burn-cubecl/cuda", "corridorkey-base/cuda"]

@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "cuda"]
 wgpu = ["corridorkey-core/wgpu"]
 cpu = ["corridorkey-core/cpu"]
 cuda = ["corridorkey-core/cuda"]

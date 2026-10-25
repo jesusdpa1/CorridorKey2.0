@@ -39,6 +39,7 @@ path_mappings.json
 .claude/
 .knowledge/
 data/
+benchmarks/results/
 
 # Rust
 target/

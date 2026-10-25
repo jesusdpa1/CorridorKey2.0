@@ -10,16 +10,17 @@ name = "corridorkey"
 path = "src/main.rs"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "cuda"]
 # CubeCL runtimes (chosen at run time with --runtime among those compiled in)
-wgpu = ["corridorkey-core/wgpu", "corridorkey-base/wgpu"]
-cpu = ["corridorkey-core/cpu", "corridorkey-base/cpu"]
-cuda = ["corridorkey-core/cuda", "corridorkey-base/cuda"]
-hip = ["corridorkey-core/hip", "corridorkey-base/hip"]
+wgpu = ["corridorkey-core/wgpu", "corridorkey-base/wgpu", "corridorkey-ml/wgpu"]
+cpu = ["corridorkey-core/cpu", "corridorkey-base/cpu", "corridorkey-ml/cpu"]
+cuda = ["corridorkey-core/cuda", "corridorkey-base/cuda", "corridorkey-ml/cuda"]
+hip = ["corridorkey-core/hip", "corridorkey-base/hip", "corridorkey-ml/hip"]
 
 [dependencies]
 corridorkey-core = { workspace = true, features = ["compute"] }
 corridorkey-base = { workspace = true, default-features = false }
+corridorkey-ml = { workspace = true, default-features = false }
 cubecl.workspace = true
 safetensors.workspace = true
 clap.workspace = true

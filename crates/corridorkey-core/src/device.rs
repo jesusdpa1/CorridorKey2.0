@@ -38,7 +38,7 @@ pub enum ComputeError {
 }
 
 impl ComputeTarget {
-    pub const ALL: [ComputeTarget; 4] = [Self::Wgpu, Self::Cuda, Self::Hip, Self::Cpu];
+    pub const ALL: [ComputeTarget; 4] = [Self::Cuda, Self::Wgpu, Self::Hip, Self::Cpu];
 
     pub fn name(self) -> &'static str {
         match self {
