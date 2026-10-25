@@ -93,6 +93,10 @@ def parse_args():
                         help="Number of iterations for warm latency timing")
     parser.add_argument("--skip-wgpu", action="store_true",
                         help="Skip WebGPU benchmark and only compare PyTorch vs Rust CUDA")
+    parser.add_argument("--flex32", action="store_true",
+                        help="Enable Flex32 Tensor Core matmul acceleration in Rust")
+    parser.add_argument("--profile", action="store_true",
+                        help="Print fine-grained internal layer profiling breakdown")
     return parser.parse_args()
 
 
@@ -294,10 +298,16 @@ def main():
         str(staging_dir), str(rust_cuda_out),
         "--runtime", "cuda"
     ]
+    if args.flex32:
+        cmd_cuda.append("--flex32")
+    if args.profile:
+        cmd_cuda.append("--profile")
     res_cuda, cuda_peak_vram, cuda_peak_rss = run_monitored_subprocess(cmd_cuda)
     if res_cuda.returncode != 0:
         print("Rust CUDA stderr:\n", res_cuda.stderr)
         raise RuntimeError("Rust CUDA execution failed")
+    if args.profile:
+        print(res_cuda.stdout)
 
     cuda_timing = json.loads((rust_cuda_out / "rust_timing.json").read_text())
     cuda_logits = np.frombuffer((rust_cuda_out / "rust_logits_bthwc.f32").read_bytes(), dtype=np.float32).reshape(1, H_pad, W_pad, 4)
@@ -340,6 +350,8 @@ def main():
             str(staging_dir), str(rust_wgpu_out),
             "--runtime", "wgpu"
         ]
+        if args.flex32:
+            cmd_wgpu.append("--flex32")
         res_wgpu, wgpu_peak_vram, wgpu_peak_rss = run_monitored_subprocess(cmd_wgpu)
         if res_wgpu.returncode != 0:
             print("Rust WGPU stderr:\n", res_wgpu.stderr)

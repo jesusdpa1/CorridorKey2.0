@@ -349,6 +349,118 @@ impl Stage1 {
         Ok(x_dec)
     }
 
+    /// Profiles the individual sub-components of Stage 1 with device-synchronized timings.
+    pub fn profile_breakdown<F: CkFloat>(
+        &self,
+        ctx: &MlContext,
+        rgb_hint_bthwc: Tensor<5>,
+        vfm_64_bthwc: Tensor<5>,
+        hint_quality_bt: Option<Tensor<2>>,
+        t_stride: f64,
+    ) -> CkResult<()> {
+        use corridorkey_core::compute::bench::time_device;
+        let [b, t, h, w, _] = rgb_hint_bthwc.dims();
+        let bt = b * t;
+        let h16 = h / 16;
+        let w16 = w / 16;
+        let h64 = h / 64;
+        let w64 = w / 64;
+
+        let d_stem = time_device(ctx.client(), 3, || {
+            let _ = self.stem.forward::<F>(ctx, rgb_hint_bthwc.clone().reshape([bt, h, w, 4])).unwrap();
+        });
+        println!("    Stage 1 stem (patchify):                   {:6.2} ms", d_stem.as_secs_f64() * 1e3);
+
+        let f_16_patch = self.stem.forward::<F>(ctx, rgb_hint_bthwc.reshape([bt, h, w, 4]))?.reshape([b, t, h16, w16, self.d_16]);
+        let d_enc = time_device(ctx.client(), 3, || {
+            let mut f = f_16_patch.clone();
+            for blk in &self.enc_16 {
+                f = blk.forward::<F>(ctx, f, hint_quality_bt.clone()).unwrap();
+            }
+        });
+        println!("    Stage 1 enc_16 (2 FullSpatial blocks):      {:6.2} ms ({:.2} ms/blk)", d_enc.as_secs_f64() * 1e3, (d_enc.as_secs_f64() * 1e3) / self.enc_16.len() as f64);
+        let mut f_16_enc = f_16_patch.clone();
+        for blk in &self.enc_16 {
+            f_16_enc = blk.forward::<F>(ctx, f_16_enc, hint_quality_bt.clone())?;
+        }
+
+        let d_down_fuse = time_device(ctx.client(), 3, || {
+            let f_64_down = self.down.forward::<F>(ctx, f_16_enc.clone().reshape([bt, h16, w16, self.d_16])).unwrap().reshape([b, t, h64, w64, self.d_16]);
+            let combined = Tensor::cat(vec![vfm_64_bthwc.clone(), f_64_down], 4);
+            let _ = match &self.fuse {
+                Some(fuse) => fuse.forward::<F, 5>(ctx, combined).unwrap(),
+                None => combined,
+            };
+        });
+        println!("    Stage 1 downsample + fusion:               {:6.2} ms", d_down_fuse.as_secs_f64() * 1e3);
+        let f_64_down = self.down.forward::<F>(ctx, f_16_enc.clone().reshape([bt, h16, w16, self.d_16]))?.reshape([b, t, h64, w64, self.d_16]);
+        let combined = Tensor::cat(vec![vfm_64_bthwc, f_64_down], 4);
+        let mut f_64 = match &self.fuse {
+            Some(fuse) => fuse.forward::<F, 5>(ctx, combined)?,
+            None => combined,
+        };
+
+        let split = self.body_64.len() / 2;
+        let d_body1 = time_device(ctx.client(), 3, || {
+            let mut f = f_64.clone();
+            for blk in &self.body_64[..split] {
+                f = blk.forward::<F>(ctx, f, t_stride).unwrap();
+            }
+        });
+        println!("    Stage 1 body_64 first half (5 blocks):     {:6.2} ms ({:.2} ms/blk)", d_body1.as_secs_f64() * 1e3, (d_body1.as_secs_f64() * 1e3) / split as f64);
+        for blk in &self.body_64[..split] {
+            f_64 = blk.forward::<F>(ctx, f_64, t_stride)?;
+        }
+
+        let d_mid_up = time_device(ctx.client(), 3, || {
+            let _ = self.mid_up.forward::<F>(ctx, f_64.clone().reshape([bt, h64, w64, self.d_64])).unwrap();
+        });
+        println!("    Stage 1 mid_up (Upsample4Icnr):            {:6.2} ms", d_mid_up.as_secs_f64() * 1e3);
+
+        let f_16_mid_up = self.mid_up.forward::<F>(ctx, f_64.clone().reshape([bt, h64, w64, self.d_64]))?.reshape([b, t, h16, w16, self.d_16]);
+        let mut f_16_mid = add_scaled_skip::<F>(ctx, f_16_mid_up, f_16_enc, &self.mid_skip_scale, self.d_16)?;
+
+        for (i, blk) in self.mid_16.iter().enumerate() {
+            let d_blk = time_device(ctx.client(), 3, || {
+                let _ = blk.forward::<F>(ctx, f_16_mid.clone(), t_stride, None).unwrap();
+            });
+            println!("      mid_16 block {i} (shift {:?}):         {:6.2} ms", blk.shift, d_blk.as_secs_f64() * 1e3);
+            f_16_mid = blk.forward::<F>(ctx, f_16_mid, t_stride, None)?;
+        }
+
+        let d_mid_down = time_device(ctx.client(), 3, || {
+            let _ = self.mid_down.forward::<F>(ctx, f_16_mid.clone().reshape([bt, h16, w16, self.d_16])).unwrap();
+        });
+        println!("    Stage 1 mid_down (Downsample4):            {:6.2} ms", d_mid_down.as_secs_f64() * 1e3);
+        let f_64_delta = self.mid_down.forward::<F>(ctx, f_16_mid.clone().reshape([bt, h16, w16, self.d_16]))?.reshape([b, t, h64, w64, self.d_64]);
+        f_64 = f_64 + f_64_delta;
+
+        let d_body2 = time_device(ctx.client(), 3, || {
+            let mut f = f_64.clone();
+            for blk in &self.body_64[split..] {
+                f = blk.forward::<F>(ctx, f, t_stride).unwrap();
+            }
+        });
+        println!("    Stage 1 body_64 second half (5 blocks):    {:6.2} ms ({:.2} ms/blk)", d_body2.as_secs_f64() * 1e3, (d_body2.as_secs_f64() * 1e3) / (self.body_64.len() - split) as f64);
+        for blk in &self.body_64[split..] {
+            f_64 = blk.forward::<F>(ctx, f_64, t_stride)?;
+        }
+
+        let d_dec = time_device(ctx.client(), 3, || {
+            let f_16_up = self.up.forward::<F>(ctx, f_64.clone().reshape([bt, h64, w64, self.d_64])).unwrap().reshape([b, t, h16, w16, self.d_16]);
+            let mut x_dec = add_scaled_skip::<F>(ctx, f_16_up, f_16_mid.clone(), &self.uskip_scale, self.d_16).unwrap();
+            let late_skip_idx = self.dec_16.len().saturating_sub(2);
+            for (i, blk) in self.dec_16.iter().enumerate() {
+                if i == late_skip_idx {
+                    x_dec = add_scaled_skip::<F>(ctx, x_dec, f_16_patch.clone(), &self.patch_late_skip_scale, self.d_16).unwrap();
+                }
+                x_dec = blk.forward::<F>(ctx, x_dec, t_stride).unwrap();
+            }
+        });
+        println!("    Stage 1 dec_16 (8 mixed Swin/CSwin):       {:6.2} ms ({:.2} ms/blk)", d_dec.as_secs_f64() * 1e3, (d_dec.as_secs_f64() * 1e3) / self.dec_16.len() as f64);
+        Ok(())
+    }
+
     /// Runs Stage 1 and returns both `baton` (`[B, T, H / 16, W / 16, d_16]`) and `aux`
     /// (`[B, T, H / 2, W / 2, 4]`).
     pub fn forward<F: CkFloat>(

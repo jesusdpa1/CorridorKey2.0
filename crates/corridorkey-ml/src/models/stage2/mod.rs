@@ -215,6 +215,60 @@ impl Stage2 {
 
         self.depatchify.forward::<F>(ctx, x)
     }
+
+    /// Profiles the individual sub-components of Stage 2 with device-synchronized timings.
+    pub fn profile_breakdown<F: CkFloat>(
+        &self,
+        ctx: &MlContext,
+        rgb_nhwc: Tensor<4>,
+        baton_nhwc: Tensor<4>,
+    ) -> CkResult<()> {
+        use corridorkey_core::compute::bench::time_device;
+        let d_p1 = time_device(ctx.client(), 3, || {
+            let _ = self.patch_1.forward::<F>(ctx, rgb_nhwc.clone()).unwrap();
+        });
+        println!("    Stage 2 patch_1 (patchify):                {:6.2} ms", d_p1.as_secs_f64() * 1e3);
+
+        let rgb_feat = self.patch_1.forward::<F>(ctx, rgb_nhwc.clone())?;
+        let x_in = Tensor::cat(vec![baton_nhwc, rgb_feat], 3);
+
+        let d_pre = time_device(ctx.client(), 3, || {
+            let mut x = x_in.clone();
+            for blk in &self.pre_blocks {
+                x = blk.forward::<F>(ctx, x).unwrap();
+            }
+        });
+        println!("    Stage 2 pre_blocks (8 blocks):             {:6.2} ms ({:.2} ms/blk)", d_pre.as_secs_f64() * 1e3, (d_pre.as_secs_f64() * 1e3) / self.pre_blocks.len() as f64);
+        let mut x = x_in;
+        for blk in &self.pre_blocks {
+            x = blk.forward::<F>(ctx, x)?;
+        }
+
+        if let Some(skip) = &self.patch_2_skip {
+            let d_skip = time_device(ctx.client(), 3, || {
+                let _ = skip.forward::<F>(ctx, x.clone(), rgb_nhwc.clone()).unwrap();
+            });
+            println!("    Stage 2 patch_2_skip:                      {:6.2} ms", d_skip.as_secs_f64() * 1e3);
+            x = skip.forward::<F>(ctx, x, rgb_nhwc)?;
+        }
+
+        let d_final = time_device(ctx.client(), 3, || {
+            let mut xf = x.clone();
+            for blk in &self.final_blocks {
+                xf = blk.forward::<F>(ctx, xf).unwrap();
+            }
+        });
+        println!("    Stage 2 final_blocks (2 Swin blocks):      {:6.2} ms ({:.2} ms/blk)", d_final.as_secs_f64() * 1e3, (d_final.as_secs_f64() * 1e3) / self.final_blocks.len() as f64);
+        for blk in &self.final_blocks {
+            x = blk.forward::<F>(ctx, x)?;
+        }
+
+        let d_depatch = time_device(ctx.client(), 3, || {
+            let _ = self.depatchify.forward::<F>(ctx, x.clone()).unwrap();
+        });
+        println!("    Stage 2 depatchify (16x pixel shuffle):    {:6.2} ms", d_depatch.as_secs_f64() * 1e3);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

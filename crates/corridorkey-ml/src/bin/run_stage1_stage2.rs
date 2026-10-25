@@ -52,7 +52,8 @@ fn main() {
         Some(name) => ComputeTarget::parse(name).expect("valid target"),
         None => ComputeTarget::from_env().unwrap_or(ComputeTarget::Cuda),
     };
-    println!("Running CorridorKey Rust inference on target: {target:?}");
+    let use_flex32 = args.iter().any(|a| a == "--flex32");
+    println!("Running CorridorKey Rust inference on target: {target:?} (flex32={use_flex32})");
 
     let meta: RunMeta =
         serde_json::from_str(&fs::read_to_string(in_dir.join("meta.json")).unwrap()).unwrap();
@@ -73,7 +74,10 @@ fn main() {
     let st = SafetensorsFile::open(&ckpt_path).unwrap();
     let header = st.checkpoint_header().unwrap();
 
-    let ctx = MlContext::new(target).unwrap();
+    let mut ctx = MlContext::new(target).unwrap();
+    if use_flex32 {
+        ctx = ctx.with_flex32_matmul(true);
+    }
     let t0 = Instant::now();
     let stage1 = Stage1::load(&ctx, &st, &header.model_config, "stage1").unwrap();
     let stage2 = Stage2::load(&ctx, &st, &header.model_config, "stage2").unwrap();
@@ -125,6 +129,13 @@ fn main() {
     let warm_total_ms = warm_stage1_ms + warm_stage2_ms;
     println!("Warm Stage 2: {warm_stage2_ms:.2} ms");
     println!("Warm Total (Stage 1 + Stage 2): {warm_total_ms:.2} ms");
+
+    if args.iter().any(|a| a == "--profile") {
+        println!("\n=== Internal Layer Profiling Breakdown ===");
+        stage1.profile_breakdown::<f32>(&ctx, t_rgb_hint.clone(), t_vfm.clone(), Some(t_hq.clone()), 1.0).unwrap();
+        stage2.profile_breakdown::<f32>(&ctx, t_rgb.clone(), baton_nhwc.clone()).unwrap();
+        println!("==========================================\n");
+    }
 
     // 4. Download and save outputs
     let logits = final_logits.unwrap();

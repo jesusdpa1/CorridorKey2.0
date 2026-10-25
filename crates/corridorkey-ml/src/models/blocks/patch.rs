@@ -440,12 +440,16 @@ impl Depatchify {
 }
 
 /// Device-resident `Downsample4` (`corridorkey/blocks.py`): `Conv2d(k=8, s=4, pad=2)` + optional `RmsNorm`.
+/// Implemented via `im2col_nhwc_kernel` + tiled GEMM so large channel-count downsampling runs at
+/// full Tensor Core speed instead of falling back to scalar direct convolution.
 #[derive(Clone, Debug)]
 pub struct Downsample4 {
-    weight_ohwi: Tensor<4>,
-    bias: Tensor<1>,
+    weight_k2io: Tensor<2>,
+    bias: Handle,
     norm: Option<RmsNorm>,
     in_channels: usize,
+    out_channels: usize,
+    kernel: usize,
     stride: usize,
     pad: usize,
 }
@@ -462,16 +466,19 @@ impl Downsample4 {
         norm_w: Option<&[F]>,
     ) -> CkResult<Self> {
         let pad = (kernel - stride) / 2;
-        let ohwi = conv_weight_oihw_to_ohwi(weight_oihw, out_channels, in_channels, kernel, kernel);
+        let k2_i = kernel * kernel * in_channels;
+        let k2io = conv_weight_oihw_to_k2io(weight_oihw, out_channels, in_channels, kernel);
         let norm = match norm_w {
             Some(nw) => Some(RmsNorm::from_slice(ctx, nw, DEFAULT_RMS_NORM_EPS)?),
             None => None,
         };
         Ok(Self {
-            weight_ohwi: ctx.upload_tensor(&ohwi, [out_channels, kernel, kernel, in_channels])?,
-            bias: ctx.upload_tensor(bias, [out_channels])?,
+            weight_k2io: ctx.upload_tensor(&k2io, [k2_i, out_channels])?,
+            bias: upload(ctx.client(), bias),
             norm,
             in_channels,
+            out_channels,
+            kernel,
             stride,
             pad,
         })
@@ -504,20 +511,65 @@ impl Downsample4 {
     }
 
     pub fn forward<F: CkFloat>(&self, ctx: &MlContext, x_nhwc: Tensor<4>) -> CkResult<Tensor<4>> {
-        let [_, _, _, c] = x_nhwc.dims();
+        let [bt, h, w, c] = x_nhwc.dims();
         if c != self.in_channels {
             return Err(CkError::Shape(format!(
                 "Downsample4 expected in_channels={}, got {c}",
                 self.in_channels
             )));
         }
-        let conv_out = run_conv2d_nhwc(
-            x_nhwc,
-            self.weight_ohwi.clone(),
-            Some(self.bias.clone()),
-            [self.stride, self.stride],
-            [self.pad, self.pad],
-        )?;
+        if !h.is_multiple_of(self.stride) || !w.is_multiple_of(self.stride) {
+            return Err(CkError::Shape(format!(
+                "Downsample4 spatial dims ({h}, {w}) must divide stride={}",
+                self.stride
+            )));
+        }
+        let h_out = h / self.stride;
+        let w_out = w / self.stride;
+        let tokens = bt * h_out * w_out;
+        let k2_i = self.kernel * self.kernel * self.in_channels;
+
+        let c_x = into_contiguous_cube(x_nhwc)?;
+        let total_cols = tokens * k2_i;
+        let cols_h = empty::<F>(ctx.client(), total_cols);
+        let geom_col = LaunchGeometry::elementwise(ctx.client(), total_cols);
+        unsafe {
+            im2col_nhwc_kernel::launch::<F>(
+                ctx.client(),
+                geom_col.cube_count,
+                geom_col.cube_dim,
+                BufferArg::from_raw_parts(c_x.handle, bt * h * w * c),
+                BufferArg::from_raw_parts(cols_h.clone(), total_cols),
+                total_cols as u32,
+                h as u32,
+                w as u32,
+                c as u32,
+                h_out as u32,
+                w_out as u32,
+                self.kernel as u32,
+                self.stride as u32,
+                self.pad as u32,
+            );
+        }
+
+        let cols_2d = ctx.tensor_from_handle(cols_h, [tokens, k2_i], elem_dtype::<F>());
+        let out_2d = ctx.matmul(cols_2d, self.weight_k2io.clone());
+        let c_out = into_contiguous_cube(out_2d)?;
+        let total_out = tokens * self.out_channels;
+        let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
+        unsafe {
+            add_row_bias_kernel::launch::<F>(
+                ctx.client(),
+                geom_out.cube_count,
+                geom_out.cube_dim,
+                BufferArg::from_raw_parts(c_out.handle.clone(), total_out),
+                BufferArg::from_raw_parts(self.bias.clone(), self.out_channels),
+                total_out as u32,
+                self.out_channels as u32,
+            );
+        }
+
+        let conv_out = ctx.tensor_from_handle(c_out.handle, [bt, h_out, w_out, self.out_channels], elem_dtype::<F>());
         match &self.norm {
             Some(norm) => norm.forward::<F, 4>(ctx, conv_out),
             None => Ok(conv_out),
@@ -527,12 +579,14 @@ impl Downsample4 {
 
 /// Device-resident `Upsample4ICNR` (`corridorkey/blocks.py`):
 /// `1×1 proj + PixelShuffle(4)` + residual `3×3 smooth conv` + optional `RmsNorm`.
+/// Smooth convolution runs via `im2col_nhwc_kernel` + tiled GEMM for hardware acceleration.
 #[derive(Clone, Debug)]
 pub struct Upsample4Icnr {
     proj_shuffle: Depatchify,
-    smooth_w_ohwi: Tensor<4>,
-    smooth_b: Tensor<1>,
+    smooth_weight_k2io: Tensor<2>,
+    smooth_bias: Handle,
     norm: Option<RmsNorm>,
+    out_channels: usize,
 }
 
 impl Upsample4Icnr {
@@ -550,17 +604,19 @@ impl Upsample4Icnr {
     ) -> CkResult<Self> {
         let proj_shuffle =
             Depatchify::from_linear_slices(ctx, in_channels, out_channels, r, proj_w_oi, proj_b)?;
-        let smooth_ohwi =
-            conv_weight_oihw_to_ohwi(smooth_w_oihw, out_channels, out_channels, 3, 3);
+        let k2_i = 3 * 3 * out_channels;
+        let smooth_k2io =
+            conv_weight_oihw_to_k2io(smooth_w_oihw, out_channels, out_channels, 3);
         let norm = match norm_w {
             Some(nw) => Some(RmsNorm::from_slice(ctx, nw, DEFAULT_RMS_NORM_EPS)?),
             None => None,
         };
         Ok(Self {
             proj_shuffle,
-            smooth_w_ohwi: ctx.upload_tensor(&smooth_ohwi, [out_channels, 3, 3, out_channels])?,
-            smooth_b: ctx.upload_tensor(smooth_b, [out_channels])?,
+            smooth_weight_k2io: ctx.upload_tensor(&smooth_k2io, [k2_i, out_channels])?,
+            smooth_bias: upload(ctx.client(), smooth_b),
             norm,
+            out_channels,
         })
     }
 
@@ -595,13 +651,51 @@ impl Upsample4Icnr {
 
     pub fn forward<F: CkFloat>(&self, ctx: &MlContext, x_nhwc: Tensor<4>) -> CkResult<Tensor<4>> {
         let up = self.proj_shuffle.forward::<F>(ctx, x_nhwc)?;
-        let smooth = run_conv2d_nhwc(
-            up.clone(),
-            self.smooth_w_ohwi.clone(),
-            Some(self.smooth_b.clone()),
-            [1, 1],
-            [1, 1],
-        )?;
+        let [bt, h, w, c] = up.dims();
+        let tokens = bt * h * w;
+        let k2_i = 3 * 3 * self.out_channels;
+
+        let c_up = into_contiguous_cube(up.clone())?;
+        let total_cols = tokens * k2_i;
+        let cols_h = empty::<F>(ctx.client(), total_cols);
+        let geom_col = LaunchGeometry::elementwise(ctx.client(), total_cols);
+        unsafe {
+            im2col_nhwc_kernel::launch::<F>(
+                ctx.client(),
+                geom_col.cube_count,
+                geom_col.cube_dim,
+                BufferArg::from_raw_parts(c_up.handle, bt * h * w * c),
+                BufferArg::from_raw_parts(cols_h.clone(), total_cols),
+                total_cols as u32,
+                h as u32,
+                w as u32,
+                c as u32,
+                h as u32,
+                w as u32,
+                3u32,
+                1u32,
+                1u32,
+            );
+        }
+
+        let cols_2d = ctx.tensor_from_handle(cols_h, [tokens, k2_i], elem_dtype::<F>());
+        let out_2d = ctx.matmul(cols_2d, self.smooth_weight_k2io.clone());
+        let c_out = into_contiguous_cube(out_2d)?;
+        let total_out = tokens * self.out_channels;
+        let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
+        unsafe {
+            add_row_bias_kernel::launch::<F>(
+                ctx.client(),
+                geom_out.cube_count,
+                geom_out.cube_dim,
+                BufferArg::from_raw_parts(c_out.handle.clone(), total_out),
+                BufferArg::from_raw_parts(self.smooth_bias.clone(), self.out_channels),
+                total_out as u32,
+                self.out_channels as u32,
+            );
+        }
+
+        let smooth = ctx.tensor_from_handle(c_out.handle, [bt, h, w, self.out_channels], elem_dtype::<F>());
         let sum = up + smooth;
         match &self.norm {
             Some(norm) => norm.forward::<F, 4>(ctx, sum),
