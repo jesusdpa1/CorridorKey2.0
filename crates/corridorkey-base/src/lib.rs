@@ -1,12 +1,13 @@
 //! Image kernels for CorridorKey on the device (any GPU through wgpu, CUDA or HIP, or the CPU),
-//! written as CubeCL kernels: colour transfer functions, and (to come) resize, pad / crop,
-//! despill and compositing.
+//! written as CubeCL kernels: colour transfer functions, frame preparation (upload, pad, the
+//! model and backbone inputs), and (to come) despill and compositing.
 //!
 //! # Where things are
 //!
 //! | Need | Module | Start with |
 //! |---|---|---|
 //! | sRGB / linear / asinh | [`color`] | [`color::convert`] |
+//! | Decoded frames → network inputs | [`frame`] | [`frame::frame_views`] |
 //! | Device buffers and shared kernels | [`core`] | [`core::buffer`] |
 //!
 //! Functions take a cubecl `Client`, from [`corridorkey_core::compute::ComputeTarget`]:
@@ -20,3 +21,4 @@ mod test_support;
 
 pub mod color;
 pub mod core;
+pub mod frame;
