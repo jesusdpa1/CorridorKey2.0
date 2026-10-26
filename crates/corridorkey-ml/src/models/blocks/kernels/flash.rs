@@ -20,8 +20,8 @@ use corridorkey_core::{
 
 /// Head sizes [`sdpa_rows_kernel`] is compiled for (`head_dim` is a comptime parameter so the
 /// per-row registers stay registers): RVM's recurrent core (48), Stage 1 `/16`, DINOv2 and RVM's
-/// encoder (64), Stage 2 (80), Stage 1 `/64` (96).
-pub const SDPA_ROWS_HEAD_DIMS: [usize; 4] = [48, 64, 80, 96];
+/// encoder (64), C-RADIO SO400M (72), Stage 2 (80), Stage 1 `/64` (96).
+pub const SDPA_ROWS_HEAD_DIMS: [usize; 5] = [48, 64, 72, 80, 96];
 
 /// Attention over `[groups, n_tokens, head_dim]` (`groups` = windows × heads), queries
 /// `q_base .. q_base + CUBE_DIM_X` of group `g` per cube, cubes ordered `(g, query tile)`.

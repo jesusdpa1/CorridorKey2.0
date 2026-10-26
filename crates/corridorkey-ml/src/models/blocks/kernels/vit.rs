@@ -124,8 +124,9 @@ pub fn bias_layerscale_residual_kernel<F: CkFloat>(
     }
 }
 
-/// Builds `[n, 1 + patches, dim]` tokens: the class token then the patch embeddings, each plus its
-/// position embedding (`pos`: `[1 + patches, dim]`).
+/// Builds `[n, prefix + patches, dim]` tokens: the `prefix` learned tokens (`cls`: `[prefix, dim]`,
+/// e.g. a CLS token, or CLS + registers) then the patch embeddings, each plus its row of `pos`
+/// (`[prefix + patches, dim]`; zero rows where a model does not encode a prefix token's position).
 #[cube(launch)]
 pub fn assemble_tokens_kernel<F: CkFloat>(
     patches: &[F],
@@ -133,19 +134,48 @@ pub fn assemble_tokens_kernel<F: CkFloat>(
     pos: &[F],
     output: &mut [F],
     total: u32,
+    prefix: u32,
     num_patches: u32,
     dim: u32,
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < total {
         let c = i % dim;
-        let t = (i / dim) % (num_patches + 1u32);
-        let n = i / (dim * (num_patches + 1u32));
-        // Index 0 for the class row so the read stays in bounds if both arms are evaluated.
-        let p_idx = if t > 0u32 { (n * num_patches + t - 1u32) * dim + c } else { 0u32 };
+        let tokens = prefix + num_patches;
+        let t = (i / dim) % tokens;
+        let n = i / (dim * tokens);
+        let is_patch = t >= prefix;
+        // In-bounds indices for both arms (an `if` expression may evaluate both).
+        let p_idx = if is_patch { (n * num_patches + t - prefix) * dim + c } else { 0u32 };
+        let c_idx = if is_patch { 0u32 } else { t * dim + c };
         let patch = patches[p_idx as usize];
-        let base = if t > 0u32 { patch } else { cls[c as usize] };
+        let token = cls[c_idx as usize];
+        let base = if is_patch { patch } else { token };
         output[i as usize] = base + pos[(t * dim + c) as usize];
+    }
+}
+
+/// Patch tokens of `[n, prefix + patches, dim]` as `[n, patches, dim]`, normalised per channel:
+/// `(x - mean[c]) · inv_std[c]` (the feature statistics CorridorKey applies to a backbone).
+#[cube(launch)]
+pub fn drop_prefix_normalize_kernel<F: CkFloat>(
+    tokens: &[F],
+    mean: &[F],
+    inv_std: &[F],
+    output: &mut [F],
+    total: u32,
+    prefix: u32,
+    num_patches: u32,
+    dim: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < total {
+        let c = i % dim;
+        let p = (i / dim) % num_patches;
+        let n = i / (dim * num_patches);
+        let x = f32::cast_from(tokens[((n * (prefix + num_patches) + prefix + p) * dim + c) as usize]);
+        let y = (x - f32::cast_from(mean[c as usize])) * f32::cast_from(inv_std[c as usize]);
+        output[i as usize] = F::cast_from(y);
     }
 }
 

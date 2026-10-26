@@ -199,6 +199,7 @@ impl MogeEncoder {
                 BufferArg::from_raw_parts(pos, tokens_n * dim),
                 BufferArg::from_raw_parts(x.clone(), total),
                 total as u32,
+                1,
                 patches_n as u32,
                 dim as u32,
             );

@@ -34,7 +34,7 @@ pub use swiglu::{
     swiglu_gate_kernel,
 };
 pub use vit::{
-    assemble_tokens_kernel, bias_gelu_kernel, bias_layerscale_residual_kernel, layer_norm_kernel,
+    assemble_tokens_kernel, bias_gelu_kernel, drop_prefix_normalize_kernel, bias_layerscale_residual_kernel, layer_norm_kernel,
     merge_heads_kernel, split_heads_kernel,
 };
 pub use recurrent::{copy_range_kernel, gru_gates_kernel, state_update_kernel};

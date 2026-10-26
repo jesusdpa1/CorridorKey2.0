@@ -217,6 +217,7 @@ impl RvmSmall {
                 BufferArg::from_raw_parts(self.pos_table::<F>(ctx, rows, cols), frame_len),
                 BufferArg::from_raw_parts(x.clone(), total),
                 total as u32,
+                1,
                 patches_n as u32,
                 dim as u32,
             );

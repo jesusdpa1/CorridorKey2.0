@@ -251,3 +251,16 @@ fn attention_kernels_at_model_shapes() {
         }
     }
 }
+
+/// f16 GEMM error against an f64 reference as the reduction length grows: f32 accumulation (then
+/// f16 output rounding) stays flat in `k`, f16 accumulation grows with it.
+#[test]
+#[ignore = "benchmark"]
+fn f16_gemm_error_vs_reduction_length() {
+    for target in ComputeTarget::available() {
+        let ctx = MlContext::new(target).unwrap();
+        for k in [256, 1280, 4304, 8192] {
+            println!("{target} k={k:5}: max |err| / max |out| = {:.3e}", f16_gemm_error(&ctx, 385, k, 512));
+        }
+    }
+}

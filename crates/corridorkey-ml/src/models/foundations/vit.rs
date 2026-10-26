@@ -319,13 +319,21 @@ pub struct VitBlock {
 
 impl VitBlock {
     /// timm / DINOv2 naming: `norm1`, `attn.qkv`, `attn.proj`, `ls1.gamma`, `norm2`, `mlp.fc1`,
-    /// `mlp.fc2`, `ls2.gamma`; LayerNorm eps 1e-6.
+    /// `mlp.fc2`, `ls2.gamma` (LayerScale optional: absent in timm ViTs built without
+    /// `init_values`, e.g. C-RADIO's SO400M); LayerNorm eps 1e-6.
     pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str, heads: usize) -> CkResult<Self> {
         let lin = |n: &str| Linear::load::<F>(ctx, st, &format!("{prefix}.{n}"), true);
-        let gamma = |n: &str| -> CkResult<Handle> { Ok(upload(ctx.client(), &st.read_as::<F>(&format!("{prefix}.{n}.gamma"))?.1)) };
         let attn = Attention::self_attention(lin("attn.qkv")?, lin("attn.proj")?, heads)?;
+        let dim = attn.out.out_dim;
+        let gamma = |n: &str| -> CkResult<Handle> {
+            let name = format!("{prefix}.{n}.gamma");
+            if st.entry(&name).is_err() {
+                return Ok(ones::<F>(ctx, dim));
+            }
+            Ok(upload(ctx.client(), &st.read_as::<F>(&name)?.1))
+        };
         Ok(Self {
-            dim: attn.out.out_dim,
+            dim,
             norm1: LayerNorm::load::<F>(ctx, st, &format!("{prefix}.norm1"), VIT_LAYER_NORM_EPS)?,
             attn,
             ls1: gamma("ls1")?,
@@ -412,6 +420,38 @@ pub fn resize_pos_embed_bicubic(
                     for (d, s) in dst.iter_mut().zip(src) {
                         *d += w * s;
                     }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resizes a `[in_h, in_w, dim]` table to `[out_h, out_w, dim]` like PyTorch's
+/// `interpolate(mode="bilinear", align_corners=False)` without antialias (each output samples its
+/// two nearest inputs per axis, source index clamped at 0), in f64 on the host.
+pub fn resize_table_bilinear(table: &[f64], (in_h, in_w): (usize, usize), dim: usize, (out_h, out_w): (usize, usize)) -> Vec<f64> {
+    let axis = |input: usize, out: usize| -> Vec<(usize, usize, f64)> {
+        let scale = input as f64 / out as f64;
+        (0..out)
+            .map(|o| {
+                let src = (scale * (o as f64 + 0.5) - 0.5).max(0.0);
+                let i0 = (src.floor() as usize).min(input - 1);
+                let i1 = (i0 + 1).min(input - 1);
+                (i0, i1, src - i0 as f64)
+            })
+            .collect()
+    };
+    let (ys, xs) = (axis(in_h, out_h), axis(in_w, out_w));
+    let mut out = vec![0.0; out_h * out_w * dim];
+    for (r, &(y0, y1, ly)) in ys.iter().enumerate() {
+        for (c, &(x0, x1, lx)) in xs.iter().enumerate() {
+            let taps = [(y0, x0, (1.0 - ly) * (1.0 - lx)), (y0, x1, (1.0 - ly) * lx), (y1, x0, ly * (1.0 - lx)), (y1, x1, ly * lx)];
+            let dst = &mut out[(r * out_w + c) * dim..(r * out_w + c + 1) * dim];
+            for (y, x, w) in taps {
+                let src = &table[(y * in_w + x) * dim..(y * in_w + x + 1) * dim];
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d += w * s;
                 }
             }
         }
