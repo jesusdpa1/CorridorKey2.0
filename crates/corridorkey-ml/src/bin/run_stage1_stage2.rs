@@ -220,7 +220,7 @@ fn run<F: CkFloat>(in_dir: &Path, out_dir: &Path, ctx: &MlContext, args: &[Strin
 
     let timing = Timing {
         target: format!("{target:?}"),
-        dtype: std::any::type_name::<F>().to_string(),
+        dtype: if size_of::<F>() == 2 { "f16" } else { "f32" }.to_string(),
         load_ms,
         cold_ms,
         warm_stage1_ms,
