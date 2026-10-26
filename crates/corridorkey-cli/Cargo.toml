@@ -22,6 +22,10 @@ corridorkey-core = { workspace = true, features = ["compute"] }
 corridorkey-base = { workspace = true, default-features = false }
 corridorkey-ml = { workspace = true, default-features = false }
 cubecl.workspace = true
+burn-tensor.workspace = true
+half.workspace = true
+image.workspace = true
+exr.workspace = true
 safetensors.workspace = true
 clap.workspace = true
 anyhow.workspace = true

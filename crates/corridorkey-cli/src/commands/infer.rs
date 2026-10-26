@@ -1,5 +1,6 @@
 //! `infer`: key a clip (`infer.py`). Every option of the Python entry point, typed and checked
-//! here; the run itself is the Python runtime until the Burn pipeline replaces it.
+//! here. The run is the Rust engine (`commands::keying`) by default; `--engine python` runs
+//! `infer.py` instead (options the Rust engine does not support yet are refused with that hint).
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,31 @@ pub enum ExrDtype {
     Float,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// The CubeCL / Burn pipeline (this binary)
+    Rust,
+    /// `infer.py` in the package's Python environment
+    Python,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// The device's fastest supported type (f16 on GPUs that support it)
+    Auto,
+    F32,
+    F16,
+}
+
+#[derive(Args, Debug)]
+pub struct EngineArgs {
+    #[arg(long, value_enum, default_value_t = Engine::Rust)]
+    pub engine: Engine,
+    /// Compute precision of the Rust engine
+    #[arg(long, value_enum, default_value_t = Precision::Auto)]
+    pub precision: Precision,
+}
+
 #[derive(Args, Debug)]
 pub struct InferArgs {
     /// Input video file or directory of image frames
@@ -55,6 +81,8 @@ pub struct InferArgs {
     #[arg(long, value_delimiter = ',', default_values = ["alpha", "fg"])]
     pub outputs: Vec<Output>,
 
+    #[command(flatten, next_help_heading = "Engine")]
+    pub engine: EngineArgs,
     #[command(flatten, next_help_heading = "Hints")]
     pub hints: HintArgs,
     #[command(flatten, next_help_heading = "Frames")]
@@ -286,13 +314,16 @@ impl InferArgs {
     }
 }
 
-pub fn run(root: &Path, args: &InferArgs) -> Result<()> {
+pub fn run(root: &Path, target: anyhow::Result<corridorkey_core::ComputeTarget>, args: &InferArgs) -> Result<()> {
     args.validate()?;
     let missing = super::assets::AssetPaths::new(root).missing();
     if args.weights.is_none() && !missing.is_empty() {
         bail!("missing asset(s): {}; run `corridorkey weights download`", missing.join(", "));
     }
-    super::python::run_script(root, "infer.py", &args.to_python_args())
+    match args.engine.engine {
+        Engine::Rust => super::keying::run(root, target?, args),
+        Engine::Python => super::python::run_script(root, "infer.py", &args.to_python_args()),
+    }
 }
 
 #[cfg(test)]

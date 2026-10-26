@@ -2,6 +2,7 @@
 //! module with its own arguments; this file only parses and dispatches.
 
 mod commands;
+mod io;
 mod progress;
 
 use std::path::PathBuf;
@@ -65,7 +66,12 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Doctor => commands::doctor::run(&root, cli.target().ok()),
         Command::Weights(args) => commands::weights::run(&root, args),
-        Command::Infer(args) => commands::infer::run(&root, args),
+        Command::Infer(args) => {
+            commands::infer::run(&root, cli.target(), args)?;
+            // Writers are flushed and closed: exit now rather than tearing the GPU runtimes down
+            // (driver threads can race process teardown; dsp-kitchen lessons §7).
+            std::process::exit(0)
+        }
         Command::Interactive(args) => commands::interactive::run(&root, args),
     }
 }

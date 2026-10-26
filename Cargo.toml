@@ -28,6 +28,9 @@ cubek-attention = { version = "0.3.1", default-features = false }
 safetensors = "0.8.0"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
+# Frame-directory input and EXR output of the command line
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+exr = "1.74.2"
 
 # CLI & assets
 clap = { version = "4.6.7", features = ["derive", "cargo", "env"] }
