@@ -8,8 +8,10 @@ pub mod depthwise;
 pub mod flash;
 pub mod norm;
 pub mod patch;
+pub mod recurrent;
 pub mod sdpa;
 pub mod swiglu;
+pub mod vit;
 
 pub use adaln::{adaln_gate_residual_kernel, adaln_modulate_kernel, silu_bias_kernel};
 pub use attn::{
@@ -31,3 +33,8 @@ pub use swiglu::{
     add_row_bias_kernel, add_row_bias_residual_kernel, silu, swiglu_gate_fused_kernel,
     swiglu_gate_kernel,
 };
+pub use vit::{
+    assemble_tokens_kernel, bias_gelu_kernel, bias_layerscale_residual_kernel, layer_norm_kernel,
+    merge_heads_kernel, split_heads_kernel,
+};
+pub use recurrent::{copy_range_kernel, gru_gates_kernel, state_update_kernel};

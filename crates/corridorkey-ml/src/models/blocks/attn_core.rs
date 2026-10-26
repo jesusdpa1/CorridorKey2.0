@@ -6,19 +6,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use burn_cubecl::kernel::attention::{AttentionStrategy, attention as cube_attention};
+use burn_cubecl::kernel::attention::flash_attention;
 use burn_cubecl::tensor::CubeTensor;
 use burn_tensor::{DType, Shape, Tensor, ops::AttentionModuleOptions};
 use cubecl::prelude::{Client, Scalar};
 use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
-use cubek_attention::forward::routines::blackbox_accelerated::BlackboxAcceleratedStrategy;
+use cubek_attention::forward::{
+    launch::{BlueprintStrategy, Strategy},
+    routines::blackbox_accelerated::BlackboxAcceleratedStrategy,
+};
 use half::f16;
 use corridorkey_base::core::{
     CkFloat,
     buffer::{empty, upload},
 };
 use corridorkey_core::compute::tune::{size_class, tune_id};
-use corridorkey_core::{CkError, CkResult, compute::LaunchGeometry};
+use corridorkey_core::{CkError, CkResult, ComputeTarget, compute::LaunchGeometry};
 use cubecl::{prelude::BufferArg, server::Handle};
 
 use crate::{
@@ -147,13 +150,18 @@ impl SdpaInputs {
         ))
     }
 
+    /// cubek's tensor-core flash attention through `flash_attention`, which reports a shape its
+    /// routine cannot run as an error (the tuner then drops the candidate). Burn's `attention`
+    /// instead degrades such shapes to its global-memory fallback (e.g. 97-token ViT sequences),
+    /// which is slower and, in f16, measurably less accurate (MoGe f16 features: max error 0.21 on
+    /// CUDA vs 0.085 with our kernel).
     fn run_cubek_flash(self, num_planes: u8) -> Result<CubeTensor, String> {
-        let strategy = AttentionStrategy::FlashBlackboxAccelerated(BlackboxAcceleratedStrategy {
+        let strategy = Strategy::BlackboxAccelerated(BlueprintStrategy::Inferred(BlackboxAcceleratedStrategy {
             num_planes,
             seq_q: 1,
             seq_kv: 1,
-        });
-        cube_attention(self.q, self.k, self.v, None, None, AttentionModuleOptions::default(), strategy)
+        }));
+        flash_attention(self.q, self.k, self.v, None, None, AttentionModuleOptions::default(), strategy)
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -162,7 +170,12 @@ impl SdpaInputs {
 pub const ATTENTION_ENV: &str = "CORRIDORKEY_ATTENTION";
 
 fn tuned_sdpa(ctx: &MlContext, inputs: SdpaInputs) -> CubeTensor {
-    static TUNER: LocalTuner<String, String> = local_tuner!("corridorkey-sdpa");
+    // Decisions persist across runs (`target/environment`), keyed by this name and the inputs, not by
+    // what the candidates do: bump the version whenever a candidate's behaviour changes, or a stale
+    // decision selects a candidate that no longer runs ("Should run when selected by autotune").
+    // v2: cubek candidates call `flash_attention` (errors on unsupported shapes) instead of
+    // `attention` (silently degraded to its fallback). v3: no cubek candidates on wgpu.
+    static TUNER: LocalTuner<String, String> = local_tuner!("corridorkey-sdpa-v3");
     let client = ctx.client().clone();
     let id = tune_id(&client);
     let has_f16_cmma = {
@@ -173,7 +186,10 @@ fn tuned_sdpa(ctx: &MlContext, inputs: SdpaInputs) -> CubeTensor {
     // Part of the tune id, so each candidate set keeps its own persisted decisions.
     let own_only = std::env::var(ATTENTION_ENV).is_ok_and(|v| v.trim() == "own");
     let id = if own_only { format!("{id}-own") } else { id };
-    let has_f16_cmma = has_f16_cmma && !own_only;
+    // cubek flash is not offered on wgpu: it lost every measured shape there (1.4–30× slower than
+    // our kernel, `tests/bench_stage2_ops.rs`), and compiling its cooperative-matrix shaders for
+    // Vulkan takes minutes per tuning run, so even trying it costs more than it could win.
+    let has_f16_cmma = has_f16_cmma && !own_only && ctx.target() != ComputeTarget::Wgpu;
     let set = TUNER.init(&id, move || {
         let key = |i: &SdpaInputs| {
             let [batches, heads, tokens, head_dim] = i.dims;

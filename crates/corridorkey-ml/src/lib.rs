@@ -23,6 +23,7 @@ pub use models::{
         Stage1DecBlock3d, Stage2Block2d, SwiGlu, SwinBlock2d, SwinBlock3d, Upsample4Icnr, rms_norm,
         transpose_2d,
     },
+    foundations::{MogeEncoder, RvmSmall},
     rope::{DEFAULT_ROPE_BASE, Rope2d, Rope3d, apply_rotary},
     stage1::{STAGE1_PATCH_SIZE, STAGE1_SHAPE_QUANTUM, Stage1, Stage1Output},
     stage2::{STAGE2_OUT_CHANNELS, STAGE2_PATCH_SIZE, Stage2},
