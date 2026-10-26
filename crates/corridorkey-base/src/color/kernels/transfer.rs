@@ -74,10 +74,27 @@ pub fn linear_to_asinh<F: Float, N: Size>(x: Vector<F, N>, inv_knee: F, inv_deno
     with_sign_of(asinh_nonnegative(Vector::abs(x) * Vector::new(inv_knee)), x) * Vector::new(inv_denom)
 }
 
+/// Below this `|x|`, [`sinh_accurate`] uses its 7th-order Taylor polynomial (9th-order remainder
+/// `x⁹ / 362880` is `< 6e-9` relative); above it `(eˣ - e⁻ˣ) / 2` has no cancellation to speak of.
+pub const SINH_TAYLOR_CUTOFF: f32 = 0.5;
+
+/// `sinh(x)` accurate to a few ulp over the `f32` range, independent of the backend: Vulkan's
+/// `GLSL.std.450 Sinh` carries no precision guarantee (like the backends' `asinh`, see
+/// [`asinh_nonnegative`]), and `(eˣ - e⁻ˣ) / 2` alone cancels near 0.
+#[cube]
+pub fn sinh_accurate<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    let x2 = x * x;
+    let small = x * (Vector::new(F::new(1.0f32))
+        + x2 * (Vector::new(F::new(1.0f32 / 6.0f32))
+            + x2 * (Vector::new(F::new(1.0f32 / 120.0f32)) + x2 * Vector::new(F::new(1.0f32 / 5040.0f32)))));
+    let large = (Vector::exp(x) - Vector::exp(-x)) * Vector::new(F::new(0.5f32));
+    select_many(Vector::abs(x).less_than(&Vector::new(F::new(SINH_TAYLOR_CUTOFF))), small, large)
+}
+
 /// Inverse of [`linear_to_asinh`]: `sinh(y · denom) · knee`.
 #[cube]
 pub fn asinh_to_linear<F: Float, N: Size>(y: Vector<F, N>, knee: F, denom: F) -> Vector<F, N> {
-    Vector::sinh(y * Vector::new(denom)) * Vector::new(knee)
+    sinh_accurate::<F, N>(y * Vector::new(denom)) * Vector::new(knee)
 }
 
 /// `output[i] = encode_to(scale · decode_from(input[i]) + offset)` for vectors `i < len`: decode

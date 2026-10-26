@@ -17,7 +17,10 @@ use cubecl::server::Handle;
 use crate::color::asinh_params;
 use crate::core::buffer::{empty, upload};
 use crate::core::{CkFloat, cast};
-use kernels::{area_resize_kernel, bilinear_resize_kernel, frame_views_kernel};
+use kernels::{
+    OUT_ALPHA, OUT_CHECKER, OUT_CUTOUT, OUT_FG, area_resize_kernel, bilinear_resize_kernel, frame_views_kernel,
+    render_f32_kernel, render_u16_kernel,
+};
 
 /// Packs bytes four per little-endian `u32` word (zero-padded), the form kernels read 8-bit data in.
 pub fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
@@ -169,4 +172,146 @@ impl BackboneInputs {
             moge_hw,
         }
     }
+}
+
+/// An output stream of `infer.py` (`--outputs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RenderOutput {
+    /// The matte, clamped to [0, 1] (video: three equal channels; EXR: one).
+    Alpha,
+    /// The foreground (video: sRGB; EXR: scene-linear, unclamped).
+    Fg,
+    /// Despilled foreground plus alpha, BGRA.
+    Cutout,
+    /// Despilled foreground composited over a 64-pixel checkerboard in linear light.
+    Checker,
+}
+
+impl RenderOutput {
+    fn code(self) -> u32 {
+        match self {
+            Self::Alpha => OUT_ALPHA,
+            Self::Fg => OUT_FG,
+            Self::Cutout => OUT_CUTOUT,
+            Self::Checker => OUT_CHECKER,
+        }
+    }
+
+    /// Channels per pixel of the written frames.
+    pub fn channels(self, exr: bool) -> usize {
+        match self {
+            Self::Alpha if exr => 1,
+            Self::Cutout => 4,
+            _ => 3,
+        }
+    }
+}
+
+/// How logits become output frames (`meta` fields of `_render_predictions_*`).
+#[derive(Debug, Clone, Copy)]
+pub struct RenderSettings {
+    /// Native size written; the logits are cropped from the padded model size at `pad`.
+    pub native_hw: (usize, usize),
+    pub padded_hw: (usize, usize),
+    /// `(top, left)` padding.
+    pub pad: (usize, usize),
+    /// The clip's linear adjustment (undone before rendering).
+    pub adjust: LinearAdjust,
+    pub despill: f64,
+    /// `--cutout_linear`: despill the linear foreground for the cutout instead of the sRGB one.
+    pub cutout_linear: bool,
+}
+
+impl RenderSettings {
+    pub fn new(meta: &FrameMeta, despill: f64, cutout_linear: bool) -> Self {
+        Self {
+            native_hw: meta.native_hw,
+            padded_hw: meta.shape_hw,
+            pad: (meta.pad.top, meta.pad.left),
+            adjust: meta.linear_adjust,
+            despill,
+            cutout_linear,
+        }
+    }
+}
+
+/// Launch arguments shared by both render kernels.
+fn render_args(settings: &RenderSettings) -> (f32, f32, f32, f32, f32) {
+    let (inv_scale, inv_offset) = settings.adjust.inverse_affine();
+    let (knee, denom) = asinh_params();
+    (inv_scale as f32, inv_offset as f32, knee as f32, denom as f32, settings.despill as f32)
+}
+
+/// 16-bit frames `[t, h, w, channels]` (BGR / BGRA, values `floor(x · 65535)`) of `output` from
+/// `[t, H, W, 4]` logits: one download.
+pub fn render_video<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> Vec<u16> {
+    let (h, w) = settings.padded_hw;
+    let (oh, ow) = settings.native_hw;
+    let channels = output.channels(false);
+    let total = t * oh * ow * channels;
+    let words_n = total.div_ceil(2);
+    let words = empty::<u32>(client, words_n);
+    let (inv_scale, inv_offset, knee, denom, strength) = render_args(settings);
+    let geom = LaunchGeometry::elementwise(client, words_n);
+    unsafe {
+        render_u16_kernel::launch::<F>(
+            client,
+            geom.cube_count,
+            geom.cube_dim,
+            BufferArg::from_raw_parts(logits.clone(), t * h * w * 4),
+            BufferArg::from_raw_parts(words.clone(), words_n),
+            total as u32,
+            h as u32,
+            w as u32,
+            oh as u32,
+            ow as u32,
+            settings.pad.0 as u32,
+            settings.pad.1 as u32,
+            inv_scale,
+            inv_offset,
+            knee,
+            denom,
+            strength,
+            channels as u32,
+            output.code(),
+            settings.cutout_linear,
+        );
+    }
+    let words: Vec<u32> = crate::core::buffer::download(client, words);
+    words.into_iter().flat_map(|w| [w as u16, (w >> 16) as u16]).take(total).collect()
+}
+
+/// f32 EXR frames `[t, h, w, channels]` of `output` from `[t, H, W, 4]` logits: one download.
+pub fn render_exr<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> Vec<f32> {
+    let (h, w) = settings.padded_hw;
+    let (oh, ow) = settings.native_hw;
+    let channels = output.channels(true);
+    let total = t * oh * ow * channels;
+    let out = empty::<f32>(client, total);
+    let (inv_scale, inv_offset, knee, denom, strength) = render_args(settings);
+    let geom = LaunchGeometry::elementwise(client, total);
+    unsafe {
+        render_f32_kernel::launch::<F>(
+            client,
+            geom.cube_count,
+            geom.cube_dim,
+            BufferArg::from_raw_parts(logits.clone(), t * h * w * 4),
+            BufferArg::from_raw_parts(out.clone(), total),
+            total as u32,
+            h as u32,
+            w as u32,
+            oh as u32,
+            ow as u32,
+            settings.pad.0 as u32,
+            settings.pad.1 as u32,
+            inv_scale,
+            inv_offset,
+            knee,
+            denom,
+            strength,
+            channels as u32,
+            output.code(),
+        );
+    }
+    crate::core::buffer::download(client, out)
 }
