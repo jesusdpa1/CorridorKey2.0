@@ -19,7 +19,6 @@ use crate::{
         kernels::{
             add_gated_rgb_skip_kernel, add_row_bias_kernel, col2im_nhwc_kernel, im2col_nhwc_kernel,
         },
-        mlp::transpose_2d,
         norm::{DEFAULT_RMS_NORM_EPS, RmsNorm},
     },
     runtime::{MlContext, elem_dtype, from_cube, into_contiguous_cube, into_cube},
@@ -187,7 +186,9 @@ impl PatchifyConv {
         }
         let k2_i = k * k * in_channels;
         if weight_oihw.len() != out_channels * k2_i || bias.len() != out_channels {
-            return Err(CkError::Shape("PatchifyConv weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "PatchifyConv weight/bias shape mismatch".into(),
+            ));
         }
         let k2io = conv_weight_oihw_to_k2io(weight_oihw, out_channels, in_channels, k);
         Ok(Self {
@@ -200,21 +201,29 @@ impl PatchifyConv {
         })
     }
 
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         patch: usize,
     ) -> CkResult<Self> {
-        let (w_shape, weight) = st.read_f32(&format!("{prefix}.conv.weight"))?;
-        let (_, bias) = st.read_f32(&format!("{prefix}.conv.bias"))?;
+        let (w_shape, weight) = st.read_as::<F>(&format!("{prefix}.conv.weight"))?;
+        let (_, bias) = st.read_as::<F>(&format!("{prefix}.conv.bias"))?;
         if w_shape.len() != 4 || w_shape[2] != w_shape[3] || !w_shape[2].is_multiple_of(patch) {
             return Err(CkError::Weights(format!(
                 "unexpected PatchifyConv weight shape {w_shape:?} at '{prefix}'"
             )));
         }
         let overlap_mult = w_shape[2] / patch;
-        Self::from_slices(ctx, w_shape[1], w_shape[0], patch, overlap_mult, &weight, &bias)
+        Self::from_slices(
+            ctx,
+            w_shape[1],
+            w_shape[0],
+            patch,
+            overlap_mult,
+            &weight,
+            &bias,
+        )
     }
 
     pub const fn out_channels(&self) -> usize {
@@ -318,7 +327,9 @@ impl Depatchify {
         let k = overlap_mult * r;
         let k2_o = k * k * out_channels;
         if weight_iohw.len() != in_dim * k2_o || bias.len() != out_channels {
-            return Err(CkError::Shape("Depatchify deconv weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "Depatchify deconv weight/bias shape mismatch".into(),
+            ));
         }
         let ik2o = deconv_weight_iohw_to_ik2o(weight_iohw, in_dim, out_channels, k);
         Ok(Self {
@@ -342,7 +353,9 @@ impl Depatchify {
     ) -> CkResult<Self> {
         let r2_o = r * r * out_channels;
         if weight_oi.len() != r2_o * in_dim || bias_o.len() != r2_o {
-            return Err(CkError::Shape("Depatchify linear weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "Depatchify linear weight/bias shape mismatch".into(),
+            ));
         }
         let (w_ir2o, b_r2o) =
             pixel_shuffle_linear_to_ir2o(weight_oi, bias_o, in_dim, out_channels, r);
@@ -358,11 +371,16 @@ impl Depatchify {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str, r: usize) -> CkResult<Self> {
+    pub fn load<F: CkFloat>(
+        ctx: &MlContext,
+        st: &SafetensorsFile,
+        prefix: &str,
+        r: usize,
+    ) -> CkResult<Self> {
         let deconv_key = format!("{prefix}.deconv.weight");
         if st.entry(&deconv_key).is_ok() {
-            let (w_shape, weight) = st.read_f32(&deconv_key)?;
-            let (_, bias) = st.read_f32(&format!("{prefix}.deconv.bias"))?;
+            let (w_shape, weight) = st.read_as::<F>(&deconv_key)?;
+            let (_, bias) = st.read_as::<F>(&format!("{prefix}.deconv.bias"))?;
             if w_shape.len() != 4 || w_shape[2] != w_shape[3] || !w_shape[2].is_multiple_of(r) {
                 return Err(CkError::Weights(format!(
                     "unexpected Depatchify deconv shape {w_shape:?} at '{prefix}'"
@@ -371,8 +389,8 @@ impl Depatchify {
             let overlap_mult = w_shape[2] / r;
             Self::from_deconv_slices(ctx, w_shape[0], w_shape[1], r, overlap_mult, &weight, &bias)
         } else {
-            let (w_shape, weight) = st.read_f32(&format!("{prefix}.linear.weight"))?;
-            let (_, bias) = st.read_f32(&format!("{prefix}.linear.bias"))?;
+            let (w_shape, weight) = st.read_as::<F>(&format!("{prefix}.linear.weight"))?;
+            let (_, bias) = st.read_as::<F>(&format!("{prefix}.linear.bias"))?;
             if w_shape.len() != 2 || !w_shape[0].is_multiple_of(r * r) {
                 return Err(CkError::Weights(format!(
                     "unexpected Depatchify linear shape {w_shape:?} at '{prefix}'"
@@ -435,7 +453,11 @@ impl Depatchify {
                 self.overlap_mult as u32,
             );
         }
-        Ok(ctx.tensor_from_handle(out_handle, [bt, h_out, w_out, self.out_channels], elem_dtype::<F>()))
+        Ok(ctx.tensor_from_handle(
+            out_handle,
+            [bt, h_out, w_out, self.out_channels],
+            elem_dtype::<F>(),
+        ))
     }
 }
 
@@ -484,12 +506,12 @@ impl Downsample4 {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
-        let (w_shape, weight) = st.read_f32(&format!("{prefix}.conv.weight"))?;
-        let (_, bias) = st.read_f32(&format!("{prefix}.conv.bias"))?;
+    pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
+        let (w_shape, weight) = st.read_as::<F>(&format!("{prefix}.conv.weight"))?;
+        let (_, bias) = st.read_as::<F>(&format!("{prefix}.conv.bias"))?;
         let norm_key = format!("{prefix}.norm.weight");
         let norm_w = if st.entry(&norm_key).is_ok() {
-            Some(st.read_f32(&norm_key)?.1)
+            Some(st.read_as::<F>(&norm_key)?.1)
         } else {
             None
         };
@@ -569,7 +591,11 @@ impl Downsample4 {
             );
         }
 
-        let conv_out = ctx.tensor_from_handle(c_out.handle, [bt, h_out, w_out, self.out_channels], elem_dtype::<F>());
+        let conv_out = ctx.tensor_from_handle(
+            c_out.handle,
+            [bt, h_out, w_out, self.out_channels],
+            elem_dtype::<F>(),
+        );
         match &self.norm {
             Some(norm) => norm.forward::<F, 4>(ctx, conv_out),
             None => Ok(conv_out),
@@ -605,8 +631,7 @@ impl Upsample4Icnr {
         let proj_shuffle =
             Depatchify::from_linear_slices(ctx, in_channels, out_channels, r, proj_w_oi, proj_b)?;
         let k2_i = 3 * 3 * out_channels;
-        let smooth_k2io =
-            conv_weight_oihw_to_k2io(smooth_w_oihw, out_channels, out_channels, 3);
+        let smooth_k2io = conv_weight_oihw_to_k2io(smooth_w_oihw, out_channels, out_channels, 3);
         let norm = match norm_w {
             Some(nw) => Some(RmsNorm::from_slice(ctx, nw, DEFAULT_RMS_NORM_EPS)?),
             None => None,
@@ -620,14 +645,19 @@ impl Upsample4Icnr {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str, r: usize) -> CkResult<Self> {
-        let (p_shape, proj_w) = st.read_f32(&format!("{prefix}.proj.weight"))?;
-        let (_, proj_b) = st.read_f32(&format!("{prefix}.proj.bias"))?;
-        let (s_shape, smooth_w) = st.read_f32(&format!("{prefix}.smooth.weight"))?;
-        let (_, smooth_b) = st.read_f32(&format!("{prefix}.smooth.bias"))?;
+    pub fn load<F: CkFloat>(
+        ctx: &MlContext,
+        st: &SafetensorsFile,
+        prefix: &str,
+        r: usize,
+    ) -> CkResult<Self> {
+        let (p_shape, proj_w) = st.read_as::<F>(&format!("{prefix}.proj.weight"))?;
+        let (_, proj_b) = st.read_as::<F>(&format!("{prefix}.proj.bias"))?;
+        let (s_shape, smooth_w) = st.read_as::<F>(&format!("{prefix}.smooth.weight"))?;
+        let (_, smooth_b) = st.read_as::<F>(&format!("{prefix}.smooth.bias"))?;
         let norm_key = format!("{prefix}.norm.weight");
         let norm_w = if st.entry(&norm_key).is_ok() {
-            Some(st.read_f32(&norm_key)?.1)
+            Some(st.read_as::<F>(&norm_key)?.1)
         } else {
             None
         };
@@ -695,7 +725,11 @@ impl Upsample4Icnr {
             );
         }
 
-        let smooth = ctx.tensor_from_handle(c_out.handle, [bt, h, w, self.out_channels], elem_dtype::<F>());
+        let smooth = ctx.tensor_from_handle(
+            c_out.handle,
+            [bt, h, w, self.out_channels],
+            elem_dtype::<F>(),
+        );
         let sum = up + smooth;
         match &self.norm {
             Some(norm) => norm.forward::<F, 4>(ctx, sum),
@@ -725,19 +759,20 @@ impl GatedRgbSkip {
     ) -> CkResult<Self> {
         let d_rgb = d - d_baton;
         if gate_w.len() != d_rgb * d || gate_b.len() != d_rgb {
-            return Err(CkError::Shape("GatedRgbSkip gate weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "GatedRgbSkip gate weight/bias shape mismatch".into(),
+            ));
         }
-        let gw_t = transpose_2d(gate_w, d_rgb, d);
         Ok(Self {
             patch_2,
-            gate_w_t: ctx.upload_tensor(&gw_t, [d, d_rgb])?,
+            gate_w_t: ctx.upload_transposed(gate_w, d_rgb, d)?,
             gate_b: upload(ctx.client(), gate_b),
             d,
             d_baton,
         })
     }
 
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
@@ -745,9 +780,9 @@ impl GatedRgbSkip {
         d_baton: usize,
         patch: usize,
     ) -> CkResult<Self> {
-        let patch_2 = PatchifyConv::load(ctx, st, &format!("{prefix}.patch_2"), patch)?;
-        let (_, gate_w) = st.read_f32(&format!("{prefix}.patch_2_gate.weight"))?;
-        let (_, gate_b) = st.read_f32(&format!("{prefix}.patch_2_gate.bias"))?;
+        let patch_2 = PatchifyConv::load::<F>(ctx, st, &format!("{prefix}.patch_2"), patch)?;
+        let (_, gate_w) = st.read_as::<F>(&format!("{prefix}.patch_2_gate.weight"))?;
+        let (_, gate_b) = st.read_as::<F>(&format!("{prefix}.patch_2_gate.bias"))?;
         Self::from_slices(ctx, patch_2, d, d_baton, &gate_w, &gate_b)
     }
 
@@ -759,12 +794,18 @@ impl GatedRgbSkip {
     ) -> CkResult<Tensor<4>> {
         let [bt, h, w, c] = x_nhwc.dims();
         if c != self.d {
-            return Err(CkError::Shape(format!("GatedRgbSkip expected d={}, got {c}", self.d)));
+            return Err(CkError::Shape(format!(
+                "GatedRgbSkip expected d={}, got {c}",
+                self.d
+            )));
         }
         let d_rgb = self.d - self.d_baton;
         let tokens = bt * h * w;
         let patch2 = self.patch_2.forward::<F>(ctx, rgb_nhwc)?;
-        let gate_logits = ctx.matmul(x_nhwc.clone().reshape([tokens, self.d]), self.gate_w_t.clone());
+        let gate_logits = ctx.matmul(
+            x_nhwc.clone().reshape([tokens, self.d]),
+            self.gate_w_t.clone(),
+        );
 
         let c_x = into_contiguous_cube(x_nhwc)?;
         let c_p2 = into_contiguous_cube(patch2)?;
@@ -850,16 +891,9 @@ mod tests {
 
         for target in ComputeTarget::available() {
             let ctx = MlContext::new(target).unwrap();
-            let dep = Depatchify::from_deconv_slices(
-                &ctx,
-                c_in,
-                c_out,
-                r,
-                overlap_mult,
-                &w_iohw,
-                &bias,
-            )
-            .unwrap();
+            let dep =
+                Depatchify::from_deconv_slices(&ctx, c_in, c_out, r, overlap_mult, &w_iohw, &bias)
+                    .unwrap();
             let t_in = ctx.upload_tensor(&x, [bt, h_in, w_in, c_in]).unwrap();
             let t_out = dep.forward::<f32>(&ctx, t_in).unwrap();
             let got = ctx.download_tensor::<f32, 4>(t_out).unwrap();
@@ -881,7 +915,9 @@ mod tests {
         let w_out = w_in / patch;
 
         let make_vec = |n: usize, s: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * s - 0.2).cos() * 0.25).collect()
+            (0..n)
+                .map(|i| ((i as f32) * s - 0.2).cos() * 0.25)
+                .collect()
         };
         let x = make_vec(bt * h_in * w_in * c_in, 0.11);
         let w_oihw = make_vec(c_out * c_in * k * k, 0.05);
@@ -920,16 +956,9 @@ mod tests {
 
         for target in ComputeTarget::available() {
             let ctx = MlContext::new(target).unwrap();
-            let patchify = PatchifyConv::from_slices(
-                &ctx,
-                c_in,
-                c_out,
-                patch,
-                overlap_mult,
-                &w_oihw,
-                &bias,
-            )
-            .unwrap();
+            let patchify =
+                PatchifyConv::from_slices(&ctx, c_in, c_out, patch, overlap_mult, &w_oihw, &bias)
+                    .unwrap();
             let t_in = ctx.upload_tensor(&x, [bt, h_in, w_in, c_in]).unwrap();
             let t_out = patchify.forward::<f32>(&ctx, t_in).unwrap();
             let got = ctx.download_tensor::<f32, 4>(t_out).unwrap();

@@ -18,11 +18,14 @@ use crate::{
     hub::SafetensorsFile,
     models::{
         blocks::{
-            attn_core::{AttentionCore, ShiftedRegionGroups, run_unmasked_sdpa},
+            attn_core::{
+                AttentionCore, ShiftedRegionGroups, pair_units, run_unmasked_sdpa,
+                run_unmasked_sdpa_handles,
+            },
             blocks_2d::FullSpatialAttention2d,
             fusion::AdaLnZero,
             kernels::{
-                add_row_bias_kernel, launch_sdpa_window, merge_cswin3d_gate_kernel,
+                add_row_bias_kernel, merge_cswin3d_gate_kernel,
                 pad_roll_2d_kernel, prep_cswin3d_qkv_kernel, window_partition_3d_kernel,
                 window_unpartition_3d_kernel,
             },
@@ -35,20 +38,20 @@ use crate::{
     runtime::{MlContext, elem_dtype, into_contiguous_cube},
 };
 
-fn load_optional_local_mix(
+fn load_optional_local_mix<F: CkFloat>(
     ctx: &MlContext,
     st: &SafetensorsFile,
     prefix: &str,
 ) -> CkResult<Option<DepthwiseSwiGlu2d>> {
     let lm_prefix = format!("{prefix}.local_mix");
     if st.entry(&format!("{lm_prefix}.norm.weight")).is_ok() {
-        Ok(Some(DepthwiseSwiGlu2d::load(ctx, st, &lm_prefix)?))
+        Ok(Some(DepthwiseSwiGlu2d::load::<F>(ctx, st, &lm_prefix)?))
     } else {
         Ok(None)
     }
 }
 
-fn load_optional_adaln(
+fn load_optional_adaln<F: CkFloat>(
     ctx: &MlContext,
     st: &SafetensorsFile,
     prefix: &str,
@@ -56,7 +59,7 @@ fn load_optional_adaln(
 ) -> CkResult<Option<AdaLnZero>> {
     let adaln_prefix = format!("{prefix}.adaln");
     if st.entry(&format!("{adaln_prefix}.in_proj.weight")).is_ok() {
-        Ok(Some(AdaLnZero::load(ctx, st, &adaln_prefix, dim, 2)?))
+        Ok(Some(AdaLnZero::load::<F>(ctx, st, &adaln_prefix, dim, 2)?))
     } else {
         Ok(None)
     }
@@ -77,20 +80,20 @@ pub struct FullSpatialBlock3d {
 }
 
 impl FullSpatialBlock3d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
         rope: Rope2d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
         let dim = core.dim;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let adaln = load_optional_adaln(ctx, st, prefix, dim)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let adaln = load_optional_adaln::<F>(ctx, st, prefix, dim)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             attn: FullSpatialAttention2d { core, rope },
@@ -165,18 +168,18 @@ pub struct FullSpatioTemporalBlock {
 }
 
 impl FullSpatioTemporalBlock {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
         rope: Rope3d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             core,
@@ -203,7 +206,7 @@ impl FullSpatioTemporalBlock {
             .project_qkv_spatial::<F>(ctx, u1.clone().reshape([bt, h, w, c]))?;
         let c_qkv = into_contiguous_cube(qkv_4d)?;
 
-        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx.client(), t, h, w, t_stride);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, t, h, w, t_stride);
         let (q, k, v) = self.core.prep_qkv_norm_rope::<F>(
             ctx,
             c_qkv.handle,
@@ -243,18 +246,18 @@ pub struct CSwinBlock3d {
 }
 
 impl CSwinBlock3d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
         rope: Rope3d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             core,
@@ -285,8 +288,8 @@ impl CSwinBlock3d {
             .project_qkv_spatial::<F>(ctx, u1.clone().reshape([bt, h, w, c]))?;
         let c_qkv = into_contiguous_cube(qkv_4d)?;
 
-        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx.client(), t, h, 1, t_stride);
-        let (cos_w, sin_w) = self.rope.cos_sin_handles::<F>(ctx.client(), t, 1, w, t_stride);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, t, h, 1, t_stride);
+        let (cos_w, sin_w) = self.rope.cos_sin_handles::<F>(ctx, t, 1, w, t_stride);
 
         let total_bthwh = b * n_tokens * num_heads;
         let elems_h = b * w * h_heads * (t * h) * head_dim;
@@ -298,7 +301,9 @@ impl CSwinBlock3d {
         let kw = empty::<F>(ctx.client(), elems_w);
         let vw = empty::<F>(ctx.client(), elems_w);
 
-        let geom_prep = LaunchGeometry::elementwise(ctx.client(), total_bthwh);
+        let geom_prep = LaunchGeometry::per_row(ctx.client(), total_bthwh, pair_units(head_dim));
+        let prep_block = geom_prep.cube_dim.x;
+        assert!(prep_block as usize * 2 >= head_dim, "prep cube of {prep_block} units < head_dim / 2");
         let c3 = 3 * c;
         let half_d = head_dim / 2;
         unsafe {
@@ -327,28 +332,19 @@ impl CSwinBlock3d {
                 num_heads as u32,
                 head_dim as u32,
                 u32::from(!bias_applied),
-                corridorkey_base::core::cast::<F>(DEFAULT_RMS_NORM_EPS),
+                DEFAULT_RMS_NORM_EPS as f32,
+                prep_block,
             );
         }
 
         let dt = elem_dtype::<F>();
-        let ah_handle = launch_sdpa_window::<F>(
-            ctx.client(),
-            qh,
-            kh,
-            vh,
-            None,
+        let ah_handle = run_unmasked_sdpa_handles::<F>(ctx, qh, kh, vh,
             b * w,
             h_heads,
             t * h,
             head_dim,
         )?;
-        let aw_handle = launch_sdpa_window::<F>(
-            ctx.client(),
-            qw,
-            kw,
-            vw,
-            None,
+        let aw_handle = run_unmasked_sdpa_handles::<F>(ctx, qw, kw, vw,
             b * h,
             w_heads,
             t * w,
@@ -421,7 +417,7 @@ pub struct SwinBlock3d {
 }
 
 impl SwinBlock3d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
@@ -430,13 +426,13 @@ impl SwinBlock3d {
         shift: (usize, usize),
         rope: Rope3d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
         let dim = core.dim;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let adaln = load_optional_adaln(ctx, st, prefix, dim)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let adaln = load_optional_adaln::<F>(ctx, st, prefix, dim)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             core,
@@ -451,7 +447,14 @@ impl SwinBlock3d {
         })
     }
 
-    fn region_groups(&self, t: usize, h: usize, w: usize, hp: usize, wp: usize) -> ShiftedRegionGroups {
+    fn region_groups(
+        &self,
+        t: usize,
+        h: usize,
+        w: usize,
+        hp: usize,
+        wp: usize,
+    ) -> ShiftedRegionGroups {
         let key = (t, h, w);
         let mut guard = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(groups) = guard.get(&key) {
@@ -575,9 +578,7 @@ impl SwinBlock3d {
 
         let nw_total = b * (hp / win) * (wp / win);
         let n_win_tokens = t * win * win;
-        let (cos_h, sin_h) = self
-            .rope
-            .cos_sin_handles::<F>(ctx.client(), t, win, win, t_stride);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, t, win, win, t_stride);
 
         let (q, k, v) = self.core.prep_qkv_norm_rope::<F>(
             ctx,

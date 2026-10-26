@@ -1095,6 +1095,8 @@ dependencies = [
  "corridorkey-base",
  "corridorkey-core",
  "cubecl",
+ "cubek-attention",
+ "half",
  "num-traits",
  "safetensors 0.8.0",
  "serde",

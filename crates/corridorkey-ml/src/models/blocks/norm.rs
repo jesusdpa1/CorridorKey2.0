@@ -1,8 +1,8 @@
 //! Channels-last RMSNorm (`RMSNorm` and `LayerNorm2d` in `corridorkey/blocks.py`).
 
 use burn_tensor::Tensor;
+use corridorkey_base::core::CkFloat;
 use corridorkey_base::core::buffer::{empty, upload};
-use corridorkey_base::core::{CkFloat, cast};
 use corridorkey_core::compute::LaunchGeometry;
 use corridorkey_core::{CkError, CkResult};
 use cubecl::prelude::*;
@@ -30,7 +30,9 @@ pub fn rms_norm<F: CkFloat>(
         return;
     }
     let total = num_rows * dim;
-    let geom = LaunchGeometry::elementwise(client, num_rows);
+    // The runtime sizes the cube for a row of `dim` channels (power of two for the reduction).
+    let geom = LaunchGeometry::per_row(client, num_rows, dim);
+    let block_size = geom.cube_dim.x;
     unsafe {
         rms_norm_kernel::launch::<F>(
             client,
@@ -41,8 +43,8 @@ pub fn rms_norm<F: CkFloat>(
             BufferArg::from_raw_parts(output.clone(), total),
             num_rows as u32,
             dim as u32,
-            cast::<F>(1.0 / dim as f64),
-            cast::<F>(eps),
+            eps as f32,
+            block_size,
         );
     }
 }
@@ -59,7 +61,9 @@ impl RmsNorm {
     /// Creates an `RmsNorm` from a host weight slice of length `dim`.
     pub fn from_slice<F: CkFloat>(ctx: &MlContext, weight: &[F], eps: f64) -> CkResult<Self> {
         if weight.is_empty() {
-            return Err(CkError::InvalidConfig("RmsNorm weight cannot be empty".into()));
+            return Err(CkError::InvalidConfig(
+                "RmsNorm weight cannot be empty".into(),
+            ));
         }
         Ok(Self {
             weight: upload(ctx.client(), weight),
@@ -69,9 +73,14 @@ impl RmsNorm {
     }
 
     /// Loads `<prefix>.weight` from a [`SafetensorsFile`] onto `ctx`.
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str, eps: f64) -> CkResult<Self> {
+    pub fn load<F: CkFloat>(
+        ctx: &MlContext,
+        st: &SafetensorsFile,
+        prefix: &str,
+        eps: f64,
+    ) -> CkResult<Self> {
         let key = format!("{prefix}.weight");
-        let (shape, data) = st.read_f32(&key)?;
+        let (shape, data) = st.read_as::<F>(&key)?;
         if shape.len() != 1 {
             return Err(CkError::Weights(format!(
                 "expected 1D weight for '{key}', got shape {shape:?}"
@@ -147,7 +156,9 @@ mod tests {
         let (b, h, w, dim) = (2, 3, 5, 19); // odd spatial dims and odd channel count
         let num_rows = b * h * w;
         let total = num_rows * dim;
-        let x32: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.23).sin() * 2.5).collect();
+        let x32: Vec<f32> = (0..total)
+            .map(|i| ((i as f32) * 0.23).sin() * 2.5)
+            .collect();
         let w32: Vec<f32> = (0..dim).map(|c| 0.5 + (c as f32) * 0.07).collect();
         let x64: Vec<f64> = x32.iter().map(|&v| v as f64).collect();
         let w64: Vec<f64> = w32.iter().map(|&v| v as f64).collect();
@@ -160,7 +171,11 @@ mod tests {
             let t_out = norm.forward::<f32, 4>(&ctx, t_in).unwrap();
             let got = ctx.download_tensor::<f32, 4>(t_out).unwrap();
             for (i, (&g, &ref_v)) in got.iter().zip(&want).enumerate() {
-                assert!((g as f64 - ref_v).abs() < 1e-5, "{} [{i}]: {g} vs {ref_v}", target);
+                assert!(
+                    (g as f64 - ref_v).abs() < 1e-5,
+                    "{} [{i}]: {g} vs {ref_v}",
+                    target
+                );
             }
         }
     }

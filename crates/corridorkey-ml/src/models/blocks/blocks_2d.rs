@@ -15,9 +15,12 @@ use crate::{
     hub::SafetensorsFile,
     models::{
         blocks::{
-            attn_core::{AttentionCore, ShiftedRegionGroups, run_unmasked_sdpa},
+            attn_core::{
+                AttentionCore, ShiftedRegionGroups, pair_units, run_unmasked_sdpa,
+                run_unmasked_sdpa_handles,
+            },
             kernels::{
-                add_row_bias_kernel, launch_sdpa_window, merge_cswin2d_gate_kernel,
+                add_row_bias_kernel, merge_cswin2d_gate_kernel,
                 pad_roll_2d_kernel, prep_cswin2d_qkv_kernel, window_partition_2d_kernel,
                 window_unpartition_unroll_residual_2d_kernel,
             },
@@ -30,14 +33,14 @@ use crate::{
     runtime::{MlContext, elem_dtype, into_contiguous_cube},
 };
 
-fn load_optional_local_mix(
+fn load_optional_local_mix<F: CkFloat>(
     ctx: &MlContext,
     st: &SafetensorsFile,
     prefix: &str,
 ) -> CkResult<Option<DepthwiseSwiGlu2d>> {
     let lm_prefix = format!("{prefix}.local_mix");
     if st.entry(&format!("{lm_prefix}.norm.weight")).is_ok() {
-        Ok(Some(DepthwiseSwiGlu2d::load(ctx, st, &lm_prefix)?))
+        Ok(Some(DepthwiseSwiGlu2d::load::<F>(ctx, st, &lm_prefix)?))
     } else {
         Ok(None)
     }
@@ -57,7 +60,7 @@ impl FullSpatialAttention2d {
         let (qkv_4d, bias_applied) = self.core.project_qkv_spatial::<F>(ctx, x_nhwc.clone())?;
         let c_qkv = into_contiguous_cube(qkv_4d)?;
 
-        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx.client(), h, w);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, h, w);
 
         let (q, k, v) = self.core.prep_qkv_norm_rope::<F>(
             ctx,
@@ -70,9 +73,9 @@ impl FullSpatialAttention2d {
         );
         let attn = run_unmasked_sdpa::<F>(ctx, q, k, v)?;
         let gate_tokens_2d = x_nhwc.reshape([bt * n_tokens, c]);
-        let out_handle = self
-            .core
-            .gate_and_project_out::<F>(ctx, gate_tokens_2d, attn, bt, n_tokens)?;
+        let out_handle =
+            self.core
+                .gate_and_project_out::<F>(ctx, gate_tokens_2d, attn, bt, n_tokens)?;
         Ok(ctx.tensor_from_handle(out_handle, [bt, h, w, c], elem_dtype::<F>()))
     }
 }
@@ -88,18 +91,18 @@ pub struct FullSpatialBlock2d {
 }
 
 impl FullSpatialBlock2d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
         rope: Rope2d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             attn: FullSpatialAttention2d { core, rope },
@@ -140,8 +143,8 @@ impl CSwinAttention2d {
         let (qkv_4d, bias_applied) = self.core.project_qkv_spatial::<F>(ctx, x_nhwc.clone())?;
         let c_qkv = into_contiguous_cube(qkv_4d)?;
 
-        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx.client(), h, 1);
-        let (cos_w, sin_w) = self.rope.cos_sin_handles::<F>(ctx.client(), 1, w);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, h, 1);
+        let (cos_w, sin_w) = self.rope.cos_sin_handles::<F>(ctx, 1, w);
 
         let total_bhn = b * num_heads * n_tokens;
         let elems_h = b * w * h_heads * h * head_dim;
@@ -153,7 +156,9 @@ impl CSwinAttention2d {
         let kw = empty::<F>(ctx.client(), elems_w);
         let vw = empty::<F>(ctx.client(), elems_w);
 
-        let geom_prep = LaunchGeometry::elementwise(ctx.client(), total_bhn);
+        let geom_prep = LaunchGeometry::per_row(ctx.client(), total_bhn, pair_units(head_dim));
+        let prep_block = geom_prep.cube_dim.x;
+        assert!(prep_block as usize * 2 >= head_dim, "prep cube of {prep_block} units < head_dim / 2");
         let c3 = 3 * c;
         let half_d = head_dim / 2;
         unsafe {
@@ -181,17 +186,21 @@ impl CSwinAttention2d {
                 num_heads as u32,
                 head_dim as u32,
                 u32::from(!bias_applied),
-                corridorkey_base::core::cast::<F>(DEFAULT_RMS_NORM_EPS),
+                DEFAULT_RMS_NORM_EPS as f32,
+                prep_block,
             );
         }
 
         let dt = elem_dtype::<F>();
         let ah_handle =
-            launch_sdpa_window::<F>(ctx.client(), qh, kh, vh, None, b * w, h_heads, h, head_dim)?;
+            run_unmasked_sdpa_handles::<F>(ctx, qh, kh, vh, b * w, h_heads, h, head_dim)?;
         let aw_handle =
-            launch_sdpa_window::<F>(ctx.client(), qw, kw, vw, None, b * h, w_heads, w, head_dim)?;
+            run_unmasked_sdpa_handles::<F>(ctx, qw, kw, vw, b * h, w_heads, w, head_dim)?;
 
-        let gate_logits = ctx.matmul(x_nhwc.reshape([b * n_tokens, c]), self.core.gate_w_t.clone());
+        let gate_logits = ctx.matmul(
+            x_nhwc.reshape([b * n_tokens, c]),
+            self.core.gate_w_t.clone(),
+        );
         let c_gate = into_contiguous_cube(gate_logits)?;
 
         let total_elems = b * n_tokens * c;
@@ -243,18 +252,18 @@ pub struct CSwinBlock2d {
 }
 
 impl CSwinBlock2d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
         rope: Rope2d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             attn: CSwinAttention2d { core, rope },
@@ -291,7 +300,7 @@ pub struct SwinBlock2d {
 }
 
 impl SwinBlock2d {
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
@@ -300,11 +309,11 @@ impl SwinBlock2d {
         shift: (usize, usize),
         rope: Rope2d,
     ) -> CkResult<Self> {
-        let (_, norm1_w) = st.read_f32(&format!("{prefix}.norm1.weight"))?;
-        let (_, norm2_w) = st.read_f32(&format!("{prefix}.norm2.weight"))?;
-        let core = AttentionCore::load(ctx, st, &format!("{prefix}.attn"), num_heads)?;
-        let local_mix = load_optional_local_mix(ctx, st, prefix)?;
-        let mlp = SwiGlu::load(ctx, st, &format!("{prefix}.mlp"))?;
+        let (_, norm1_w) = st.read_as::<F>(&format!("{prefix}.norm1.weight"))?;
+        let (_, norm2_w) = st.read_as::<F>(&format!("{prefix}.norm2.weight"))?;
+        let core = AttentionCore::load::<F>(ctx, st, &format!("{prefix}.attn"), num_heads)?;
+        let local_mix = load_optional_local_mix::<F>(ctx, st, prefix)?;
+        let mlp = SwiGlu::load::<F>(ctx, st, &format!("{prefix}.mlp"))?;
         Ok(Self {
             norm1: RmsNorm::from_slice(ctx, &norm1_w, DEFAULT_RMS_NORM_EPS)?,
             core,
@@ -368,7 +377,7 @@ impl SwinBlock2d {
         let has_shift = sh != 0 || sw != 0;
         let has_pad = hp != h || wp != w;
 
-        let normed1 = self.norm1.forward::<F, 4>(ctx, x.clone())?;
+        let normed1 = ctx.op("swin norm1", || self.norm1.forward::<F, 4>(ctx, x.clone()))?;
         let dt = elem_dtype::<F>();
 
         // Match Python's exact order for shifted vs unshifted + qkv_dw:
@@ -399,13 +408,16 @@ impl SwinBlock2d {
                     );
                 }
                 let rolled_t = ctx.tensor_from_handle(rolled.clone(), [b, hp, wp, c], dt);
-                let (qkv_4d, bias_done) = self.core.project_qkv_spatial::<F>(ctx, rolled_t)?;
+                let (qkv_4d, bias_done) = ctx.op("swin qkv proj+dw", || {
+                    self.core.project_qkv_spatial::<F>(ctx, rolled_t)
+                })?;
                 let c_qkv = into_contiguous_cube(qkv_4d)?;
                 (c_qkv.handle, rolled, bias_done)
             } else if has_pad {
                 // sh == 0, sw == 0, has_pad == true, qkv_dw.is_some()
-                let (qkv_orig, bias_done) =
-                    self.core.project_qkv_spatial::<F>(ctx, normed1.clone())?;
+                let (qkv_orig, bias_done) = ctx.op("swin qkv proj+dw", || {
+                    self.core.project_qkv_spatial::<F>(ctx, normed1.clone())
+                })?;
                 let c_qkv_orig = into_contiguous_cube(qkv_orig)?;
                 let c_norm1 = into_contiguous_cube(normed1)?;
                 let c3 = 3 * c;
@@ -449,78 +461,91 @@ impl SwinBlock2d {
                 }
                 (qkv_p, gate_p, bias_done)
             } else {
-                let (qkv_4d, bias_done) =
-                    self.core.project_qkv_spatial::<F>(ctx, normed1.clone())?;
+                let (qkv_4d, bias_done) = ctx.op("swin qkv proj+dw", || {
+                    self.core.project_qkv_spatial::<F>(ctx, normed1.clone())
+                })?;
                 let c_qkv = into_contiguous_cube(qkv_4d)?;
                 let c_norm1 = into_contiguous_cube(normed1)?;
                 (c_qkv.handle, c_norm1.handle, bias_done)
             };
 
         let c3 = 3 * c;
-        let qkv_win = Self::partition_2d::<F>(ctx, &qkv_padded_handle, b, hp, wp, win, c3);
-        let gate_win = Self::partition_2d::<F>(ctx, &gate_padded_handle, b, hp, wp, win, c);
+        let (qkv_win, gate_win) = ctx.op("swin partition", || {
+            (
+                Self::partition_2d::<F>(ctx, &qkv_padded_handle, b, hp, wp, win, c3),
+                Self::partition_2d::<F>(ctx, &gate_padded_handle, b, hp, wp, win, c),
+            )
+        });
 
         let nw_total = b * (hp / win) * (wp / win);
         let n_win_tokens = win * win;
-        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx.client(), win, win);
+        let (cos_h, sin_h) = self.rope.cos_sin_handles::<F>(ctx, win, win);
 
-        let (q, k, v) = self.core.prep_qkv_norm_rope::<F>(
-            ctx,
-            qkv_win,
-            &cos_h,
-            &sin_h,
-            nw_total,
-            n_win_tokens,
-            bias_applied,
-        );
+        let (q, k, v) = ctx.op("swin qk norm+rope", || {
+            self.core.prep_qkv_norm_rope::<F>(
+                ctx,
+                qkv_win,
+                &cos_h,
+                &sin_h,
+                nw_total,
+                n_win_tokens,
+                bias_applied,
+            )
+        });
 
-        let attn = if has_shift || has_pad {
-            let groups = self.region_groups(h, w, hp, wp);
-            groups.run_sdpa::<F>(ctx, q, k, v)?
-        } else {
-            run_unmasked_sdpa::<F>(ctx, q, k, v)?
-        };
+        let attn = ctx.op("swin window sdpa", || {
+            if has_shift || has_pad {
+                let groups = self.region_groups(h, w, hp, wp);
+                groups.run_sdpa::<F>(ctx, q, k, v)
+            } else {
+                run_unmasked_sdpa::<F>(ctx, q, k, v)
+            }
+        })?;
 
         let gate_tokens_2d = ctx.tensor_from_handle(gate_win, [nw_total * n_win_tokens, c], dt);
-        let proj_win_handle = self.core.gate_and_project_out::<F>(
-            ctx,
-            gate_tokens_2d,
-            attn,
-            nw_total,
-            n_win_tokens,
-        )?;
+        let proj_win_handle = ctx.op("swin gate+proj", || {
+            self.core
+                .gate_and_project_out::<F>(ctx, gate_tokens_2d, attn, nw_total, n_win_tokens)
+        })?;
 
         // Fused window unpartition + reverse cyclic shift (+sh, +sw) + crop to (H, W) + residual add
-        let c_shortcut = into_contiguous_cube(x)?;
-        let total_out = b * h * w * c;
-        let out_handle = empty::<F>(ctx.client(), total_out);
-        let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
-        unsafe {
-            window_unpartition_unroll_residual_2d_kernel::launch::<F>(
-                ctx.client(),
-                geom_out.cube_count,
-                geom_out.cube_dim,
-                BufferArg::from_raw_parts(proj_win_handle, b * hp * wp * c),
-                BufferArg::from_raw_parts(c_shortcut.handle, total_out),
-                BufferArg::from_raw_parts(out_handle.clone(), total_out),
-                total_out as u32,
-                h as u32,
-                w as u32,
-                hp as u32,
-                wp as u32,
-                win as u32,
-                c as u32,
-                sh as u32,
-                sw as u32,
-            );
-        }
+        let unpartition = ctx.op("swin unpartition+residual", || -> CkResult<Handle> {
+            let c_shortcut = into_contiguous_cube(x)?;
+            let total_out = b * h * w * c;
+            let out_handle = empty::<F>(ctx.client(), total_out);
+            let geom_out = LaunchGeometry::elementwise(ctx.client(), total_out);
+            unsafe {
+                window_unpartition_unroll_residual_2d_kernel::launch::<F>(
+                    ctx.client(),
+                    geom_out.cube_count,
+                    geom_out.cube_dim,
+                    BufferArg::from_raw_parts(proj_win_handle, b * hp * wp * c),
+                    BufferArg::from_raw_parts(c_shortcut.handle, total_out),
+                    BufferArg::from_raw_parts(out_handle.clone(), total_out),
+                    total_out as u32,
+                    h as u32,
+                    w as u32,
+                    hp as u32,
+                    wp as u32,
+                    win as u32,
+                    c as u32,
+                    sh as u32,
+                    sw as u32,
+                );
+            }
 
-        let mut res = ctx.tensor_from_handle(out_handle, [b, h, w, c], dt);
+            Ok(out_handle)
+        })?;
+        let mut res = ctx.tensor_from_handle(unpartition, [b, h, w, c], dt);
         if let Some(lm) = &self.local_mix {
-            res = lm.forward_residual::<F, 4>(ctx, res)?;
+            res = ctx.op("swin local mix", || lm.forward_residual::<F, 4>(ctx, res))?;
         }
-        let normed2 = self.norm2.forward::<F, 4>(ctx, res.clone())?;
-        self.mlp.forward_residual::<F, 4>(ctx, normed2, res)
+        let normed2 = ctx.op("swin norm2", || {
+            self.norm2.forward::<F, 4>(ctx, res.clone())
+        })?;
+        ctx.op("swin mlp", || {
+            self.mlp.forward_residual::<F, 4>(ctx, normed2, res)
+        })
     }
 }
 
@@ -577,9 +602,9 @@ mod tests {
             // pre_blocks.0 is FullSpatialBlock2d, pre_blocks.1 is SwinBlock2d(shift=(8,8) + qkv_dw),
             // pre_blocks.2 is CSwinBlock2d
             let blk0 =
-                FullSpatialBlock2d::load(&ctx, &st, "stage2.pre_blocks.0", 16, rope.clone())
+                FullSpatialBlock2d::load::<f32>(&ctx, &st, "stage2.pre_blocks.0", 16, rope.clone())
                     .unwrap();
-            let blk1 = SwinBlock2d::load(
+            let blk1 = SwinBlock2d::load::<f32>(
                 &ctx,
                 &st,
                 "stage2.pre_blocks.1",
@@ -590,7 +615,8 @@ mod tests {
             )
             .unwrap();
             let blk2 =
-                CSwinBlock2d::load(&ctx, &st, "stage2.pre_blocks.2", 16, rope.clone()).unwrap();
+                CSwinBlock2d::load::<f32>(&ctx, &st, "stage2.pre_blocks.2", 16, rope.clone())
+                    .unwrap();
 
             let (bt, h, w, c) = (1, 16, 16, 1280);
             let input: Vec<f32> = (0..bt * h * w * c)
@@ -602,7 +628,10 @@ mod tests {
             let y2 = blk2.forward::<f32>(&ctx, y1).unwrap();
             let out = ctx.download_tensor::<f32, 4>(y2).unwrap();
             assert_eq!(out.len(), bt * h * w * c);
-            assert!(out.iter().all(|v| v.is_finite()), "{target} produced non-finite output");
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "{target} produced non-finite output"
+            );
         }
     }
 }

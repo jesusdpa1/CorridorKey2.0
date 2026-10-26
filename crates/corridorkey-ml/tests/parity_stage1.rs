@@ -66,7 +66,7 @@ fn compare_stage1_with_python() {
     for target in ComputeTarget::available() {
         let ctx = MlContext::new(target).unwrap();
         let t_load = Instant::now();
-        let stage1 = Stage1::load(&ctx, &st, &header.model_config, "stage1").unwrap();
+        let stage1 = Stage1::load::<f32>(&ctx, &st, &header.model_config, "stage1").unwrap();
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
         let t_rgb_hint = ctx.upload_tensor(&rgb_hint, [b, t, h, w, 4]).unwrap();

@@ -4,6 +4,7 @@
 use cubecl::prelude::*;
 
 use corridorkey_base::core::CkFloat;
+use corridorkey_core::compute::row_position;
 
 use super::attn::sigmoid;
 
@@ -14,6 +15,11 @@ use super::attn::sigmoid;
 ///   `[B * W, h_heads, T * H, head_dim]` with `(cos_h, sin_h)` (`[T * H, head_dim / 2]`).
 /// - `h_heads..num_heads` (H-stripes along `T * W`): written to `q_w, k_w, v_w` of shape
 ///   `[B * H, w_heads, T * W, head_dim]` with `(cos_w, sin_w)` (`[T * W, head_dim / 2]`).
+/// Rows are `(b, t, y, x, head)`, head fastest.
+///
+/// One cube per `(token, head)` vector; unit `p` owns the pair `(2p, 2p + 1)` of q, k and v
+/// (coalesced reads and writes), q / k sums of squares reduced in f32 through shared memory.
+/// `block_size` is a power of two `>= head_dim / 2`.
 #[cube(launch)]
 pub fn prep_cswin3d_qkv_kernel<F: CkFloat>(
     qkv: &[F],
@@ -30,17 +36,22 @@ pub fn prep_cswin3d_qkv_kernel<F: CkFloat>(
     q_w: &mut [F],
     k_w: &mut [F],
     v_w: &mut [F],
-    total_bthwh: u32,
+    total_rows: u32,
     t_grid: u32,
     h_grid: u32,
     w_grid: u32,
     num_heads: u32,
     head_dim: u32,
     apply_bias: u32,
-    eps: F,
+    eps: f32,
+    #[comptime] block_size: u32,
 ) {
-    let idx = ABSOLUTE_POS as u32;
-    if idx < total_bthwh {
+    // Declared outside any branch (CUDA LLVM lowering).
+    let mut s_q2 = Shared::<[f32]>::new_slice(block_size as usize);
+    let mut s_k2 = Shared::<[f32]>::new_slice(block_size as usize);
+    let idx = row_position();
+    if idx < total_rows {
+        let p = UNIT_POS_X;
         let h = idx % num_heads;
         let bthw = idx / num_heads;
         let x = bthw % w_grid;
@@ -49,102 +60,89 @@ pub fn prep_cswin3d_qkv_kernel<F: CkFloat>(
         let bt = bth / h_grid;
         let t = bt % t_grid;
         let b = bt / t_grid;
-
+        let tok_base = bthw * 3u32 * num_heads * head_dim;
         let dim = num_heads * head_dim;
-        let c3 = 3u32 * dim;
-        let tok_base = bthw * c3;
         let q_off = h * head_dim;
-        let k_off = dim + h * head_dim;
-        let v_off = 2u32 * dim + h * head_dim;
-
-        let mut sum_q2 = F::new(0.0f32);
-        let mut sum_k2 = F::new(0.0f32);
-        for d in 0..head_dim {
-            let mut qv = qkv[(tok_base + q_off + d) as usize];
-            let mut kv = qkv[(tok_base + k_off + d) as usize];
-            if apply_bias != 0u32 {
-                qv += qkv_bias[(q_off + d) as usize];
-                kv += qkv_bias[(k_off + d) as usize];
-            }
-            sum_q2 += qv * qv;
-            sum_k2 += kv * kv;
-        }
-        let inv_d = F::new(1.0f32) / F::cast_from(head_dim);
-        let scale_q = F::new(1.0f32) / F::sqrt(sum_q2 * inv_d + eps);
-        let scale_k = F::new(1.0f32) / F::sqrt(sum_k2 * inv_d + eps);
-
-        let h_heads = num_heads / 2u32;
-        let w_heads = num_heads - h_heads;
+        let k_off = dim + q_off;
+        let v_off = 2u32 * dim + q_off;
         let half_d = head_dim / 2u32;
+        let active = p < half_d;
+        let d0 = 2u32 * p;
+        let d1 = d0 + 1u32;
 
-        if h < h_heads {
-            let out_base =
-                ((((b * w_grid + x) * h_heads + h) * t_grid + t) * h_grid + y) * head_dim;
-            let rope_base = (t * h_grid + y) * half_d;
-            for p in 0..half_d {
-                let d0 = 2u32 * p;
-                let d1 = d0 + 1u32;
-                let mut q0 = qkv[(tok_base + q_off + d0) as usize];
-                let mut q1 = qkv[(tok_base + q_off + d1) as usize];
-                let mut k0 = qkv[(tok_base + k_off + d0) as usize];
-                let mut k1 = qkv[(tok_base + k_off + d1) as usize];
-                let mut v0 = qkv[(tok_base + v_off + d0) as usize];
-                let mut v1 = qkv[(tok_base + v_off + d1) as usize];
-                if apply_bias != 0u32 {
-                    q0 += qkv_bias[(q_off + d0) as usize];
-                    q1 += qkv_bias[(q_off + d1) as usize];
-                    k0 += qkv_bias[(k_off + d0) as usize];
-                    k1 += qkv_bias[(k_off + d1) as usize];
-                    v0 += qkv_bias[(v_off + d0) as usize];
-                    v1 += qkv_bias[(v_off + d1) as usize];
-                }
-                q0 = q0 * scale_q * q_norm_w[d0 as usize];
-                q1 = q1 * scale_q * q_norm_w[d1 as usize];
-                k0 = k0 * scale_k * k_norm_w[d0 as usize];
-                k1 = k1 * scale_k * k_norm_w[d1 as usize];
-                let c = cos_h[(rope_base + p) as usize];
-                let s = sin_h[(rope_base + p) as usize];
-                q_h[(out_base + d0) as usize] = q0 * c - q1 * s;
-                q_h[(out_base + d1) as usize] = q1 * c + q0 * s;
-                k_h[(out_base + d0) as usize] = k0 * c - k1 * s;
-                k_h[(out_base + d1) as usize] = k1 * c + k0 * s;
-                v_h[(out_base + d0) as usize] = v0;
-                v_h[(out_base + d1) as usize] = v1;
+        let mut q0 = 0.0f32;
+        let mut q1 = 0.0f32;
+        let mut k0 = 0.0f32;
+        let mut k1 = 0.0f32;
+        let mut v0 = 0.0f32;
+        let mut v1 = 0.0f32;
+        if active {
+            q0 = f32::cast_from(qkv[(tok_base + q_off + d0) as usize]);
+            q1 = f32::cast_from(qkv[(tok_base + q_off + d1) as usize]);
+            k0 = f32::cast_from(qkv[(tok_base + k_off + d0) as usize]);
+            k1 = f32::cast_from(qkv[(tok_base + k_off + d1) as usize]);
+            v0 = f32::cast_from(qkv[(tok_base + v_off + d0) as usize]);
+            v1 = f32::cast_from(qkv[(tok_base + v_off + d1) as usize]);
+            if apply_bias != 0u32 {
+                q0 += f32::cast_from(qkv_bias[(q_off + d0) as usize]);
+                q1 += f32::cast_from(qkv_bias[(q_off + d1) as usize]);
+                k0 += f32::cast_from(qkv_bias[(k_off + d0) as usize]);
+                k1 += f32::cast_from(qkv_bias[(k_off + d1) as usize]);
+                v0 += f32::cast_from(qkv_bias[(v_off + d0) as usize]);
+                v1 += f32::cast_from(qkv_bias[(v_off + d1) as usize]);
             }
-        } else {
-            let wh = h - h_heads;
-            let out_base =
-                ((((b * h_grid + y) * w_heads + wh) * t_grid + t) * w_grid + x) * head_dim;
-            let rope_base = (t * w_grid + x) * half_d;
-            for p in 0..half_d {
-                let d0 = 2u32 * p;
-                let d1 = d0 + 1u32;
-                let mut q0 = qkv[(tok_base + q_off + d0) as usize];
-                let mut q1 = qkv[(tok_base + q_off + d1) as usize];
-                let mut k0 = qkv[(tok_base + k_off + d0) as usize];
-                let mut k1 = qkv[(tok_base + k_off + d1) as usize];
-                let mut v0 = qkv[(tok_base + v_off + d0) as usize];
-                let mut v1 = qkv[(tok_base + v_off + d1) as usize];
-                if apply_bias != 0u32 {
-                    q0 += qkv_bias[(q_off + d0) as usize];
-                    q1 += qkv_bias[(q_off + d1) as usize];
-                    k0 += qkv_bias[(k_off + d0) as usize];
-                    k1 += qkv_bias[(k_off + d1) as usize];
-                    v0 += qkv_bias[(v_off + d0) as usize];
-                    v1 += qkv_bias[(v_off + d1) as usize];
-                }
-                q0 = q0 * scale_q * q_norm_w[d0 as usize];
-                q1 = q1 * scale_q * q_norm_w[d1 as usize];
-                k0 = k0 * scale_k * k_norm_w[d0 as usize];
-                k1 = k1 * scale_k * k_norm_w[d1 as usize];
-                let c = cos_w[(rope_base + p) as usize];
-                let s = sin_w[(rope_base + p) as usize];
-                q_w[(out_base + d0) as usize] = q0 * c - q1 * s;
-                q_w[(out_base + d1) as usize] = q1 * c + q0 * s;
-                k_w[(out_base + d0) as usize] = k0 * c - k1 * s;
-                k_w[(out_base + d1) as usize] = k1 * c + k0 * s;
-                v_w[(out_base + d0) as usize] = v0;
-                v_w[(out_base + d1) as usize] = v1;
+        }
+        s_q2[p as usize] = q0 * q0 + q1 * q1;
+        s_k2[p as usize] = k0 * k0 + k1 * k1;
+        sync_cube();
+        // From the runtime `CUBE_DIM_X`, not the comptime `block_size` (dsp-kitchen §6b).
+        let mut stride = CUBE_DIM_X / 2u32;
+        while stride > 0u32 {
+            if p < stride {
+                let sq = s_q2[p as usize] + s_q2[(p + stride) as usize];
+                let sk = s_k2[p as usize] + s_k2[(p + stride) as usize];
+                s_q2[p as usize] = sq;
+                s_k2[p as usize] = sk;
+            }
+            sync_cube();
+            stride /= 2u32;
+        }
+
+        if active {
+            let inv_d = 1.0f32 / f32::cast_from(head_dim);
+            let scale_q = 1.0f32 / f32::sqrt(s_q2[0] * inv_d + eps);
+            let scale_k = 1.0f32 / f32::sqrt(s_k2[0] * inv_d + eps);
+            q0 = q0 * scale_q * f32::cast_from(q_norm_w[d0 as usize]);
+            q1 = q1 * scale_q * f32::cast_from(q_norm_w[d1 as usize]);
+            k0 = k0 * scale_k * f32::cast_from(k_norm_w[d0 as usize]);
+            k1 = k1 * scale_k * f32::cast_from(k_norm_w[d1 as usize]);
+            let h_heads = num_heads / 2u32;
+            if h < h_heads {
+                let out_base =
+                    ((((b * w_grid + x) * h_heads + h) * t_grid + t) * h_grid + y) * head_dim;
+                let rope = (t * h_grid + y) * half_d + p;
+                let c = f32::cast_from(cos_h[rope as usize]);
+                let s = f32::cast_from(sin_h[rope as usize]);
+                q_h[(out_base + d0) as usize] = F::cast_from(q0 * c - q1 * s);
+                q_h[(out_base + d1) as usize] = F::cast_from(q1 * c + q0 * s);
+                k_h[(out_base + d0) as usize] = F::cast_from(k0 * c - k1 * s);
+                k_h[(out_base + d1) as usize] = F::cast_from(k1 * c + k0 * s);
+                v_h[(out_base + d0) as usize] = F::cast_from(v0);
+                v_h[(out_base + d1) as usize] = F::cast_from(v1);
+            } else {
+                let w_heads = num_heads - h_heads;
+                let wh = h - h_heads;
+                let out_base =
+                    ((((b * h_grid + y) * w_heads + wh) * t_grid + t) * w_grid + x) * head_dim;
+                let rope = (t * w_grid + x) * half_d + p;
+                let c = f32::cast_from(cos_w[rope as usize]);
+                let s = f32::cast_from(sin_w[rope as usize]);
+                q_w[(out_base + d0) as usize] = F::cast_from(q0 * c - q1 * s);
+                q_w[(out_base + d1) as usize] = F::cast_from(q1 * c + q0 * s);
+                k_w[(out_base + d0) as usize] = F::cast_from(k0 * c - k1 * s);
+                k_w[(out_base + d1) as usize] = F::cast_from(k1 * c + k0 * s);
+                v_w[(out_base + d0) as usize] = F::cast_from(v0);
+                v_w[(out_base + d1) as usize] = F::cast_from(v1);
             }
         }
     }
@@ -185,8 +183,7 @@ pub fn merge_cswin3d_gate_kernel<F: CkFloat>(
         let gate = sigmoid::<F>(gate_logits[(bthw * num_heads + h) as usize]);
 
         let val = if h < h_heads {
-            let src =
-                ((((b * w_grid + x) * h_heads + h) * t_grid + t) * h_grid + y) * head_dim + d;
+            let src = ((((b * w_grid + x) * h_heads + h) * t_grid + t) * h_grid + y) * head_dim + d;
             attn_h[src as usize]
         } else {
             let wh = h - h_heads;

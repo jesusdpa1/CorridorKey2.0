@@ -54,7 +54,7 @@ fn test_stage1_layer_by_layer() {
 
     let target = ComputeTarget::available().into_iter().next().unwrap();
     let ctx = MlContext::new(target).unwrap();
-    let stage1 = Stage1::load(&ctx, &st, &header.model_config, "stage1").unwrap();
+    let stage1 = Stage1::load::<f32>(&ctx, &st, &header.model_config, "stage1").unwrap();
 
     let t_rgb_hint = ctx.upload_tensor(&rgb_hint, [bt, h, w, 4]).unwrap();
 

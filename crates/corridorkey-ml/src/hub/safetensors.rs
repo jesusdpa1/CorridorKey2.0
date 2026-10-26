@@ -5,11 +5,13 @@
 //! never reads the full 2.66 GB checkpoint into host memory. [`SafetensorsMap`] provides an
 //! in-memory representation for small files (`foundation_stats.safetensors`) and wasm buffers.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use corridorkey_base::core::{CkFloat, cast_f32};
 use corridorkey_core::{CkError, CkResult};
 use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
@@ -51,8 +53,8 @@ impl SafetensorsFile {
     /// Opens `path` and parses only its header.
     pub fn open(path: impl AsRef<Path>) -> CkResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = File::open(&path)
-            .map_err(|e| CkError::Io(format!("{}: {e}", path.display())))?;
+        let mut file =
+            File::open(&path).map_err(|e| CkError::Io(format!("{}: {e}", path.display())))?;
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)
             .map_err(|e| CkError::Io(format!("{}: {e}", path.display())))?;
@@ -60,18 +62,25 @@ impl SafetensorsFile {
         let mut header_buf = vec![0u8; header_len as usize];
         file.read_exact(&mut header_buf)
             .map_err(|e| CkError::Weights(format!("{}: truncated header ({e})", path.display())))?;
-        let raw_json: BTreeMap<String, Value> = serde_json::from_slice(&header_buf)
-            .map_err(|e| CkError::Weights(format!("{}: invalid safetensors header: {e}", path.display())))?;
+        let raw_json: BTreeMap<String, Value> =
+            serde_json::from_slice(&header_buf).map_err(|e| {
+                CkError::Weights(format!(
+                    "{}: invalid safetensors header: {e}",
+                    path.display()
+                ))
+            })?;
 
         let mut tensors = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         for (name, val) in raw_json {
             if name == "__metadata__" {
-                metadata = serde_json::from_value(val)
-                    .map_err(|e| CkError::Weights(format!("{}: invalid __metadata__: {e}", path.display())))?;
+                metadata = serde_json::from_value(val).map_err(|e| {
+                    CkError::Weights(format!("{}: invalid __metadata__: {e}", path.display()))
+                })?;
             } else {
-                let entry: TensorEntry = serde_json::from_value(val)
-                    .map_err(|e| CkError::Weights(format!("{}: invalid entry '{name}': {e}", path.display())))?;
+                let entry: TensorEntry = serde_json::from_value(val).map_err(|e| {
+                    CkError::Weights(format!("{}: invalid entry '{name}': {e}", path.display()))
+                })?;
                 tensors.insert(name, entry);
             }
         }
@@ -112,7 +121,10 @@ impl SafetensorsFile {
     /// Looks up a tensor's header entry by name.
     pub fn entry(&self, name: &str) -> CkResult<&TensorEntry> {
         self.tensors.get(name).ok_or_else(|| {
-            CkError::Weights(format!("tensor '{name}' not found in {}", self.path.display()))
+            CkError::Weights(format!(
+                "tensor '{name}' not found in {}",
+                self.path.display()
+            ))
         })
     }
 
@@ -125,9 +137,28 @@ impl SafetensorsFile {
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| CkError::Io(format!("{}: seek failed: {e}", self.path.display())))?;
         let mut buf = vec![0u8; entry.byte_len()];
-        file.read_exact(&mut buf)
-            .map_err(|e| CkError::Io(format!("{}: read '{name}' failed: {e}", self.path.display())))?;
+        file.read_exact(&mut buf).map_err(|e| {
+            CkError::Io(format!(
+                "{}: read '{name}' failed: {e}",
+                self.path.display()
+            ))
+        })?;
         Ok((entry.shape.clone(), buf))
+    }
+
+    /// Reads an `F32` tensor by name as the model's compute type `F` (rounded once, on the host).
+    pub fn read_as<F: CkFloat>(&self, name: &str) -> CkResult<(Vec<usize>, Vec<F>)> {
+        let (shape, values) = self.read_f32(name)?;
+        let values = match (Box::new(values) as Box<dyn Any>).downcast::<Vec<F>>() {
+            // `F` is f32: the buffer as read, no per-element pass.
+            Ok(same) => *same,
+            Err(other) => cast_f32(
+                &other
+                    .downcast::<Vec<f32>>()
+                    .expect("read_f32 returns Vec<f32>"),
+            ),
+        };
+        Ok((shape, values))
     }
 
     /// Reads an `F32` tensor by name into `(shape, Vec<f32>)`.
@@ -153,7 +184,10 @@ impl SafetensorsFile {
                 std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, n_floats * 4)
             };
             file.read_exact(byte_slice).map_err(|e| {
-                CkError::Io(format!("{}: read '{name}' failed: {e}", self.path.display()))
+                CkError::Io(format!(
+                    "{}: read '{name}' failed: {e}",
+                    self.path.display()
+                ))
             })?;
             Ok((entry.shape.clone(), values))
         }
@@ -195,15 +229,19 @@ impl SafetensorsMap {
 
     pub fn insert(&mut self, name: impl Into<String>, shape: Vec<usize>, data: Vec<f32>) {
         let expected: usize = shape.iter().product();
-        assert_eq!(data.len(), expected, "shape {shape:?} expects {expected} elements, got {}", data.len());
+        assert_eq!(
+            data.len(),
+            expected,
+            "shape {shape:?} expects {expected} elements, got {}",
+            data.len()
+        );
         self.tensors.insert(name.into(), (shape, data));
     }
 
     pub fn get(&self, name: &str) -> CkResult<(&[usize], &[f32])> {
-        let (shape, data) = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| CkError::Weights(format!("tensor '{name}' not found in safetensors map")))?;
+        let (shape, data) = self.tensors.get(name).ok_or_else(|| {
+            CkError::Weights(format!("tensor '{name}' not found in safetensors map"))
+        })?;
         Ok((shape.as_slice(), data.as_slice()))
     }
 

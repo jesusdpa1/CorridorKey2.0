@@ -27,15 +27,16 @@ pub fn silu_bias_kernel<F: CkFloat>(
     }
 }
 
-/// Applies in-place AdaLN modulation on `[BT, H * W, dim]`:
-/// `x[bt, hw, c] = x[bt, hw, c] * (1 + scale[bt, c]) + shift[bt, c]`,
+/// Applies AdaLN modulation on `[BT, H * W, dim]`:
+/// `out[bt, hw, c] = x[bt, hw, c] * (1 + scale[bt, c]) + shift[bt, c]`,
 /// reading `shift` at `params[bt * params_stride + pair_offset + c]` and `scale` at
 /// `params[bt * params_stride + pair_offset + dim + c]` (plus `proj_bias`).
 #[cube(launch)]
 pub fn adaln_modulate_kernel<F: CkFloat>(
-    x: &mut [F],
+    x: &[F],
     params: &[F],
     proj_bias: &[F],
+    output: &mut [F],
     total_elems: u32,
     hw: u32,
     dim: u32,
@@ -51,7 +52,7 @@ pub fn adaln_modulate_kernel<F: CkFloat>(
         let scale =
             params[(p_base + dim + c) as usize] + proj_bias[(pair_offset + dim + c) as usize];
         let i = idx as usize;
-        x[i] = x[i] * (F::new(1.0f32) + scale) + shift;
+        output[i] = x[i] * (F::new(1.0f32) + scale) + shift;
     }
 }
 

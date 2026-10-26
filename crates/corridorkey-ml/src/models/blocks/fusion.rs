@@ -16,7 +16,6 @@ use crate::{
             adaln_gate_residual_kernel, adaln_modulate_kernel, add_row_bias_kernel,
             silu_bias_kernel, swiglu_gate_kernel,
         },
-        mlp::transpose_2d,
         norm::{DEFAULT_RMS_NORM_EPS, RmsNorm},
     },
     runtime::{MlContext, elem_dtype, into_contiguous_cube},
@@ -57,14 +56,14 @@ impl AdaLnZero {
             || proj_w.len() != out_dim * hidden
             || proj_b.len() != out_dim
         {
-            return Err(CkError::Shape("AdaLnZero weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "AdaLnZero weight/bias shape mismatch".into(),
+            ));
         }
-        let in_wt = transpose_2d(in_w, hidden, cond_dim);
-        let proj_wt = transpose_2d(proj_w, out_dim, hidden);
         Ok(Self {
-            in_proj_w_t: ctx.upload_tensor(&in_wt, [cond_dim, hidden])?,
+            in_proj_w_t: ctx.upload_transposed(in_w, hidden, cond_dim)?,
             in_proj_b: upload(ctx.client(), in_b),
-            proj_w_t: ctx.upload_tensor(&proj_wt, [hidden, out_dim])?,
+            proj_w_t: ctx.upload_transposed(proj_w, out_dim, hidden)?,
             proj_b: upload(ctx.client(), proj_b),
             cond_dim,
             hidden,
@@ -73,17 +72,17 @@ impl AdaLnZero {
         })
     }
 
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         dim: usize,
         pairs: usize,
     ) -> CkResult<Self> {
-        let (in_shape, in_w) = st.read_f32(&format!("{prefix}.in_proj.weight"))?;
-        let (_, in_b) = st.read_f32(&format!("{prefix}.in_proj.bias"))?;
-        let (p_shape, proj_w) = st.read_f32(&format!("{prefix}.proj.weight"))?;
-        let (_, proj_b) = st.read_f32(&format!("{prefix}.proj.bias"))?;
+        let (in_shape, in_w) = st.read_as::<F>(&format!("{prefix}.in_proj.weight"))?;
+        let (_, in_b) = st.read_as::<F>(&format!("{prefix}.in_proj.bias"))?;
+        let (p_shape, proj_w) = st.read_as::<F>(&format!("{prefix}.proj.weight"))?;
+        let (_, proj_b) = st.read_as::<F>(&format!("{prefix}.proj.bias"))?;
         if in_shape.len() != 2 || p_shape.len() != 2 {
             return Err(CkError::Weights(format!(
                 "unexpected AdaLnZero shapes in={in_shape:?} proj={p_shape:?} at '{prefix}'"
@@ -91,7 +90,9 @@ impl AdaLnZero {
         }
         let hidden = in_shape[0];
         let cond_dim = in_shape[1];
-        Self::from_slices(ctx, dim, cond_dim, pairs, hidden, &in_w, &in_b, &proj_w, &proj_b)
+        Self::from_slices(
+            ctx, dim, cond_dim, pairs, hidden, &in_w, &in_b, &proj_w, &proj_b,
+        )
     }
 
     /// Computes raw (pre-`proj_b` bias) modulation parameters `[BT, pairs * 3 * dim]` as a
@@ -131,8 +132,9 @@ impl AdaLnZero {
         Ok(into_contiguous_cube(params_2d)?.handle)
     }
 
-    /// Modulates `x` (`[B, T, H, W, dim]` or `[BT, H, W, dim]`) in-place using pair `pair_idx`:
-    /// `x = x * (1 + scale) + shift`.
+    /// Modulates `x` (`[B, T, H, W, dim]` or `[BT, H, W, dim]`) using pair `pair_idx`:
+    /// `x * (1 + scale) + shift`, into a new buffer: `x` may share its buffer with the caller's
+    /// clones (Burn tensors are reference-counted), so writing it in place would change them.
     pub fn modulate<F: CkFloat, const D: usize>(
         &self,
         ctx: &MlContext,
@@ -147,15 +149,17 @@ impl AdaLnZero {
         let params_stride = self.pairs * 3 * self.dim;
         let pair_offset = pair_idx * 3 * self.dim;
         let c_x = into_contiguous_cube(x)?;
+        let out = empty::<F>(ctx.client(), total);
         let geom = LaunchGeometry::elementwise(ctx.client(), total);
         unsafe {
             adaln_modulate_kernel::launch::<F>(
                 ctx.client(),
                 geom.cube_count,
                 geom.cube_dim,
-                BufferArg::from_raw_parts(c_x.handle.clone(), total),
+                BufferArg::from_raw_parts(c_x.handle, total),
                 BufferArg::from_raw_parts(params.clone(), bt * params_stride),
                 BufferArg::from_raw_parts(self.proj_b.clone(), params_stride),
+                BufferArg::from_raw_parts(out.clone(), total),
                 total as u32,
                 hw as u32,
                 self.dim as u32,
@@ -163,7 +167,7 @@ impl AdaLnZero {
                 pair_offset as u32,
             );
         }
-        Ok(ctx.tensor_from_handle(c_x.handle, shape, elem_dtype::<F>()))
+        Ok(ctx.tensor_from_handle(out, shape, elem_dtype::<F>()))
     }
 
     /// Computes `shortcut + branch * gate` using pair `pair_idx`.
@@ -256,19 +260,15 @@ impl FusionLinSwiglu {
                 "FusionLinSwiglu weight/bias shape mismatch".into(),
             ));
         }
-        let sw_t = transpose_2d(shortcut_w, out_dim, in_dim);
-        let gw_t = transpose_2d(gate_w, hidden, in_dim);
-        let uw_t = transpose_2d(up_w, hidden, in_dim);
-        let dw_t = transpose_2d(down_w, out_dim, hidden);
         Ok(Self {
-            shortcut_w_t: ctx.upload_tensor(&sw_t, [in_dim, out_dim])?,
+            shortcut_w_t: ctx.upload_transposed(shortcut_w, out_dim, in_dim)?,
             shortcut_b: upload(ctx.client(), shortcut_b),
             norm: RmsNorm::from_slice(ctx, norm_w, DEFAULT_RMS_NORM_EPS)?,
-            gate_w_t: ctx.upload_tensor(&gw_t, [in_dim, hidden])?,
+            gate_w_t: ctx.upload_transposed(gate_w, hidden, in_dim)?,
             gate_b: upload(ctx.client(), gate_b),
-            up_w_t: ctx.upload_tensor(&uw_t, [in_dim, hidden])?,
+            up_w_t: ctx.upload_transposed(up_w, hidden, in_dim)?,
             up_b: upload(ctx.client(), up_b),
-            down_w_t: ctx.upload_tensor(&dw_t, [hidden, out_dim])?,
+            down_w_t: ctx.upload_transposed(down_w, out_dim, hidden)?,
             down_b: upload(ctx.client(), down_b),
             in_dim,
             hidden,
@@ -276,16 +276,16 @@ impl FusionLinSwiglu {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
-        let (s_shape, shortcut_w) = st.read_f32(&format!("{prefix}.linear_shortcut.weight"))?;
-        let (_, shortcut_b) = st.read_f32(&format!("{prefix}.linear_shortcut.bias"))?;
-        let (_, norm_w) = st.read_f32(&format!("{prefix}.norm.weight"))?;
-        let (g_shape, gate_w) = st.read_f32(&format!("{prefix}.w_gate.weight"))?;
-        let (_, gate_b) = st.read_f32(&format!("{prefix}.w_gate.bias"))?;
-        let (_, up_w) = st.read_f32(&format!("{prefix}.w_up.weight"))?;
-        let (_, up_b) = st.read_f32(&format!("{prefix}.w_up.bias"))?;
-        let (_, down_w) = st.read_f32(&format!("{prefix}.w_down.weight"))?;
-        let (_, down_b) = st.read_f32(&format!("{prefix}.w_down.bias"))?;
+    pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
+        let (s_shape, shortcut_w) = st.read_as::<F>(&format!("{prefix}.linear_shortcut.weight"))?;
+        let (_, shortcut_b) = st.read_as::<F>(&format!("{prefix}.linear_shortcut.bias"))?;
+        let (_, norm_w) = st.read_as::<F>(&format!("{prefix}.norm.weight"))?;
+        let (g_shape, gate_w) = st.read_as::<F>(&format!("{prefix}.w_gate.weight"))?;
+        let (_, gate_b) = st.read_as::<F>(&format!("{prefix}.w_gate.bias"))?;
+        let (_, up_w) = st.read_as::<F>(&format!("{prefix}.w_up.weight"))?;
+        let (_, up_b) = st.read_as::<F>(&format!("{prefix}.w_up.bias"))?;
+        let (_, down_w) = st.read_as::<F>(&format!("{prefix}.w_down.weight"))?;
+        let (_, down_b) = st.read_as::<F>(&format!("{prefix}.w_down.bias"))?;
         if s_shape.len() != 2 || g_shape.len() != 2 {
             return Err(CkError::Weights(format!(
                 "unexpected FusionLinSwiglu shapes s={s_shape:?} g={g_shape:?} at '{prefix}'"
@@ -350,7 +350,10 @@ impl FusionLinSwiglu {
             );
         }
 
-        let h_norm = self.norm.forward::<F, D>(ctx, x)?.reshape([tokens, self.in_dim]);
+        let h_norm = self
+            .norm
+            .forward::<F, D>(ctx, x)?
+            .reshape([tokens, self.in_dim]);
         let gate_2d = ctx.matmul(h_norm.clone(), self.gate_w_t.clone());
         let up_2d = ctx.matmul(h_norm, self.up_w_t.clone());
         let c_gate = into_contiguous_cube(gate_2d)?;
@@ -374,8 +377,7 @@ impl FusionLinSwiglu {
             );
         }
 
-        let gated_2d =
-            ctx.tensor_from_handle(gated_h, [tokens, self.hidden], elem_dtype::<F>());
+        let gated_2d = ctx.tensor_from_handle(gated_h, [tokens, self.hidden], elem_dtype::<F>());
         let nonlin_2d = ctx.matmul(gated_2d, self.down_w_t.clone());
         let c_nonlin = into_contiguous_cube(nonlin_2d)?;
         unsafe {
@@ -456,7 +458,9 @@ mod tests {
             let p_handle = adaln.compute_params::<f32>(&ctx, t_cond).unwrap();
 
             let t_x = ctx.upload_tensor(&x, [bt, hw, dim]).unwrap();
-            let t_mod = adaln.modulate::<f32, 3>(&ctx, t_x.clone(), &p_handle, bt, hw, 0).unwrap();
+            let t_mod = adaln
+                .modulate::<f32, 3>(&ctx, t_x.clone(), &p_handle, bt, hw, 0)
+                .unwrap();
             let got_mod = ctx.download_tensor::<f32, 3>(t_mod).unwrap();
 
             let t_br = ctx.upload_tensor(&branch, [bt, hw, dim]).unwrap();
@@ -466,10 +470,16 @@ mod tests {
             let got_res = ctx.download_tensor::<f32, 3>(t_res).unwrap();
 
             for (i, (&gm, &wm)) in got_mod.iter().zip(&want_mod).enumerate() {
-                assert!((gm as f64 - wm).abs() < 1e-5, "{target} mod[{i}]: {gm} vs {wm}");
+                assert!(
+                    (gm as f64 - wm).abs() < 1e-5,
+                    "{target} mod[{i}]: {gm} vs {wm}"
+                );
             }
             for (i, (&gr, &wr)) in got_res.iter().zip(&want_res).enumerate() {
-                assert!((gr as f64 - wr).abs() < 1e-5, "{target} res[{i}]: {gr} vs {wr}");
+                assert!(
+                    (gr as f64 - wr).abs() < 1e-5,
+                    "{target} res[{i}]: {gr} vs {wr}"
+                );
             }
         }
     }

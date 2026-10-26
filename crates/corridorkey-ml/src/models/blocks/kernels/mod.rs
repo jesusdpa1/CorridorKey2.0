@@ -5,6 +5,7 @@ pub mod adaln;
 pub mod attn;
 pub mod attn_3d;
 pub mod depthwise;
+pub mod flash;
 pub mod norm;
 pub mod patch;
 pub mod sdpa;
@@ -22,6 +23,7 @@ pub use attn_3d::{
     window_partition_3d_kernel, window_unpartition_3d_kernel,
 };
 pub use depthwise::{boundary_coord, depthwise_conv2d_nhwc_kernel, depthwise_swiglu_2d_kernel};
+pub use flash::{SDPA_ROWS_HEAD_DIMS, launch_sdpa_rows, sdpa_rows_key_tile, sdpa_rows_kernel};
 pub use norm::rms_norm_kernel;
 pub use patch::{add_gated_rgb_skip_kernel, col2im_nhwc_kernel, im2col_nhwc_kernel};
 pub use sdpa::{SDPA_K_TILE, SDPA_MAX_HEAD_DIM, launch_sdpa_window, sdpa_window_kernel};

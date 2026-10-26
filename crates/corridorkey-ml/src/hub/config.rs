@@ -242,9 +242,9 @@ mod tests {
 
         let target = ComputeTarget::from_env().unwrap();
         let ctx = MlContext::new(target).unwrap();
-        let norm1 = RmsNorm::load(&ctx, &st, "stage2.final_blocks.0.norm1", DEFAULT_RMS_NORM_EPS).unwrap();
-        let local_mix = DepthwiseSwiGlu2d::load(&ctx, &st, "stage2.final_blocks.0.local_mix").unwrap();
-        let mlp = SwiGlu::load(&ctx, &st, "stage2.final_blocks.0.mlp").unwrap();
+        let norm1 = RmsNorm::load::<f32>(&ctx, &st, "stage2.final_blocks.0.norm1", DEFAULT_RMS_NORM_EPS).unwrap();
+        let local_mix = DepthwiseSwiGlu2d::load::<f32>(&ctx, &st, "stage2.final_blocks.0.local_mix").unwrap();
+        let mlp = SwiGlu::load::<f32>(&ctx, &st, "stage2.final_blocks.0.mlp").unwrap();
         assert_eq!(norm1.dim(), 1280);
         assert_eq!(mlp.dim(), 1280);
         assert_eq!(mlp.hidden(), 3200);

@@ -17,7 +17,11 @@ use super::norm::{DEFAULT_RMS_NORM_EPS, RmsNorm};
 
 /// Transposes a PyTorch depthwise weight `[C, 1, K, K]` into tap-major `[K * K, C]` order so
 /// threads for adjacent channels `c` perform coalesced reads.
-pub fn depthwise_weight_to_tap_major<T: Copy>(weight: &[T], channels: usize, kernel_size: usize) -> Vec<T> {
+pub fn depthwise_weight_to_tap_major<T: Copy>(
+    weight: &[T],
+    channels: usize,
+    kernel_size: usize,
+) -> Vec<T> {
     let taps = kernel_size * kernel_size;
     assert_eq!(weight.len(), channels * taps);
     let mut out = Vec::with_capacity(weight.len());
@@ -67,10 +71,11 @@ impl QkvDepthwiseSpatial {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
-        let (shape, w) = st.read_f32(&format!("{prefix}.dw.weight"))?;
-        let (_, b) = st.read_f32(&format!("{prefix}.dw.bias"))?;
-        if shape.len() != 4 || shape[1] != 1 || shape[2] != shape[3] || !shape[0].is_multiple_of(3) {
+    pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
+        let (shape, w) = st.read_as::<F>(&format!("{prefix}.dw.weight"))?;
+        let (_, b) = st.read_as::<F>(&format!("{prefix}.dw.bias"))?;
+        if shape.len() != 4 || shape[1] != 1 || shape[2] != shape[3] || !shape[0].is_multiple_of(3)
+        {
             return Err(CkError::Weights(format!(
                 "unexpected QKVDepthwiseSpatial shape {shape:?} at '{prefix}'"
             )));
@@ -173,10 +178,14 @@ impl DepthwiseSwiGlu2d {
     ) -> CkResult<Self> {
         let taps = kernel_size * kernel_size;
         if value_w.len() != dim * taps || gate_w.len() != dim * taps {
-            return Err(CkError::Shape("DepthwiseSwiGlu2d kernel weight length mismatch".into()));
+            return Err(CkError::Shape(
+                "DepthwiseSwiGlu2d kernel weight length mismatch".into(),
+            ));
         }
         if value_b.len() != dim || gate_b.len() != dim || gamma.len() != dim {
-            return Err(CkError::Shape("DepthwiseSwiGlu2d bias/gamma length mismatch".into()));
+            return Err(CkError::Shape(
+                "DepthwiseSwiGlu2d bias/gamma length mismatch".into(),
+            ));
         }
         let vw_tap = depthwise_weight_to_tap_major(value_w, dim, kernel_size);
         let gw_tap = depthwise_weight_to_tap_major(gate_w, dim, kernel_size);
@@ -192,28 +201,20 @@ impl DepthwiseSwiGlu2d {
         })
     }
 
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
-        let (_, norm_w) = st.read_f32(&format!("{prefix}.norm.weight"))?;
-        let (v_shape, value_w) = st.read_f32(&format!("{prefix}.value.weight"))?;
-        let (_, value_b) = st.read_f32(&format!("{prefix}.value.bias"))?;
-        let (_, gate_w) = st.read_f32(&format!("{prefix}.gate.weight"))?;
-        let (_, gate_b) = st.read_f32(&format!("{prefix}.gate.bias"))?;
-        let (_, gamma) = st.read_f32(&format!("{prefix}.gamma"))?;
+    pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
+        let (_, norm_w) = st.read_as::<F>(&format!("{prefix}.norm.weight"))?;
+        let (v_shape, value_w) = st.read_as::<F>(&format!("{prefix}.value.weight"))?;
+        let (_, value_b) = st.read_as::<F>(&format!("{prefix}.value.bias"))?;
+        let (_, gate_w) = st.read_as::<F>(&format!("{prefix}.gate.weight"))?;
+        let (_, gate_b) = st.read_as::<F>(&format!("{prefix}.gate.bias"))?;
+        let (_, gamma) = st.read_as::<F>(&format!("{prefix}.gamma"))?;
         if v_shape.len() != 4 || v_shape[1] != 1 || v_shape[2] != v_shape[3] {
             return Err(CkError::Weights(format!(
                 "unexpected DepthwiseSwiGlu2d shape {v_shape:?} at '{prefix}'"
             )));
         }
         Self::from_slices(
-            ctx,
-            v_shape[0],
-            v_shape[2],
-            &norm_w,
-            &value_w,
-            &value_b,
-            &gate_w,
-            &gate_b,
-            &gamma,
+            ctx, v_shape[0], v_shape[2], &norm_w, &value_w, &value_b, &gate_w, &gate_b, &gamma,
         )
     }
 
@@ -283,7 +284,11 @@ mod tests {
         let max_idx = len - 1;
         let mapped = if reflect {
             let low = if raw < 0 { -raw } else { raw };
-            if low > max_idx { 2 * max_idx - low } else { low }
+            if low > max_idx {
+                2 * max_idx - low
+            } else {
+                low
+            }
         } else {
             raw.clamp(0, max_idx)
         };
@@ -310,9 +315,21 @@ mod tests {
                     for ch in 0..c {
                         let mut acc = b[ch];
                         for ky in 0..k {
-                            let ry = host_boundary(y as isize, ky as isize, pad as isize, h as isize, reflect);
+                            let ry = host_boundary(
+                                y as isize,
+                                ky as isize,
+                                pad as isize,
+                                h as isize,
+                                reflect,
+                            );
                             for kx in 0..k {
-                                let rx = host_boundary(col as isize, kx as isize, pad as isize, width as isize, reflect);
+                                let rx = host_boundary(
+                                    col as isize,
+                                    kx as isize,
+                                    pad as isize,
+                                    width as isize,
+                                    reflect,
+                                );
                                 let in_idx = ((batch * h + ry) * width + rx) * c + ch;
                                 let w_idx = ch * taps + ky * k + kx;
                                 acc += x[in_idx] * w[w_idx];
@@ -340,7 +357,8 @@ mod tests {
             let qkv_in = make_vec(b * h * w * c3, 0.13);
             let qkv_w = make_vec(c3 * taps, 0.09);
             let qkv_b = make_vec(c3, 0.17);
-            let want_qkv = host_dw_conv2d(&to64(&qkv_in), &to64(&qkv_w), &to64(&qkv_b), b, h, w, c3, k);
+            let want_qkv =
+                host_dw_conv2d(&to64(&qkv_in), &to64(&qkv_w), &to64(&qkv_b), b, h, w, c3, k);
 
             for target in ComputeTarget::available() {
                 let ctx = MlContext::new(target).unwrap();

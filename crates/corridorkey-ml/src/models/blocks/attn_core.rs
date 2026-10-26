@@ -6,11 +6,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use burn_tensor::{Tensor, module::attention, ops::AttentionModuleOptions};
+use burn_cubecl::kernel::attention::{AttentionStrategy, attention as cube_attention};
+use burn_cubecl::tensor::CubeTensor;
+use burn_tensor::{DType, Shape, Tensor, ops::AttentionModuleOptions};
+use cubecl::prelude::{Client, Scalar};
+use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
+use cubek_attention::forward::routines::blackbox_accelerated::BlackboxAcceleratedStrategy;
+use half::f16;
 use corridorkey_base::core::{
     CkFloat,
     buffer::{empty, upload},
 };
+use corridorkey_core::compute::tune::{size_class, tune_id};
 use corridorkey_core::{CkError, CkResult, compute::LaunchGeometry};
 use cubecl::{prelude::BufferArg, server::Handle};
 
@@ -18,55 +25,179 @@ use crate::{
     hub::SafetensorsFile,
     models::blocks::{
         kernels::{
-            add_row_bias_kernel, launch_sdpa_window, merge_heads_gate_kernel,
+            SDPA_ROWS_HEAD_DIMS, add_row_bias_kernel, launch_sdpa_rows, launch_sdpa_window,
+            merge_heads_gate_kernel,
             prep_qkv_norm_rope_kernel,
         },
         local_mix::QkvDepthwiseSpatial,
-        mlp::transpose_2d,
         norm::DEFAULT_RMS_NORM_EPS,
     },
-    runtime::{MlContext, elem_dtype, into_contiguous_cube},
+    runtime::{MlContext, elem_dtype, from_cube, into_contiguous_cube},
 };
 
-/// Maximum sequence length where [`launch_sdpa_window`] is preferred over `cubek::attention` even
-/// when `n_tokens` is a multiple of 32.
-pub const WINDOW_SDPA_MAX_TOKENS: usize = 256;
-
-/// Dispatches unmasked SDPA (`[batches, num_heads, n_tokens, head_dim]`):
-/// - Uses `burn_tensor::module::attention` (`BlackboxAccelerated` FlashAttention) when `n_tokens > 256`,
-///   `n_tokens` is divisible by `32`, and the device exposes CMMA Tensor Cores.
-/// - Otherwise uses our single-launch fused shared-memory [`launch_sdpa_window`] kernel, avoiding
-///   `cubek-attention`'s 5-kernel global-memory `attention_fallback`.
+/// Unmasked SDPA on `[batches, num_heads, n_tokens, head_dim]` with the implementation CubeCL's
+/// autotuner found fastest for this device, dtype and shape (dsp-kitchen §5c: candidates in one
+/// tune set, not a threshold). Candidates: our kernel ([`launch_attention`]), and cubek's
+/// tensor-core flash attention with 2, 4 and 8 planes where the device has f16 CMMA.
+///
+/// Measured (`tests/bench_stage2_ops.rs`, RTX 2070, head_dim 80, 16 heads): cubek wins 6–13× on
+/// CUDA; ours wins 1.4–1.6× on wgpu/Vulkan, which reports cooperative-matrix support too, so a
+/// feature check alone picks the slower path there. The candidates call explicit strategies:
+/// Burn's own `attention` autotunes internally (dozens of variants, minutes of shader compiles on
+/// Vulkan on the first run) and would nest a tuner inside ours.
 pub fn run_unmasked_sdpa<F: CkFloat>(
     ctx: &MlContext,
     q: Tensor<4>,
     k: Tensor<4>,
     v: Tensor<4>,
 ) -> CkResult<Tensor<4>> {
-    let [batches, num_heads, n_tokens, head_dim] = q.dims();
-    let has_cmma = !ctx.client().properties().features.matmul.cmma.is_empty();
-    if n_tokens > WINDOW_SDPA_MAX_TOKENS && n_tokens.is_multiple_of(32) && has_cmma {
-        return Ok(attention(q, k, v, None, None, AttentionModuleOptions::default()));
+    let inputs = SdpaInputs {
+        dims: q.dims(),
+        q: into_contiguous_cube(q)?,
+        k: into_contiguous_cube(k)?,
+        v: into_contiguous_cube(v)?,
+    };
+    Ok(from_cube(tuned_sdpa(ctx, inputs)))
+}
+
+/// Our attention kernel for `[windows, heads, n_tokens, head_dim]` (optionally region-masked):
+/// [`launch_sdpa_rows`] for the head sizes it is compiled for, else [`launch_sdpa_window`].
+/// Measured (`tests/bench_stage2_ops.rs::attention_kernels_at_model_shapes`): rows is 5–11× faster
+/// than window at every model shape on CUDA and wgpu, masked or not.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_attention<F: CkFloat>(
+    client: &Client,
+    q: Handle,
+    k: Handle,
+    v: Handle,
+    region_ids: Option<(&Handle, usize)>,
+    windows: usize,
+    heads: usize,
+    n_tokens: usize,
+    head_dim: usize,
+) -> CkResult<Handle> {
+    if SDPA_ROWS_HEAD_DIMS.contains(&head_dim) {
+        launch_sdpa_rows::<F>(client, q, k, v, region_ids, windows * heads, heads, n_tokens, head_dim)
+    } else {
+        launch_sdpa_window::<F>(client, q, k, v, region_ids, windows, heads, n_tokens, head_dim)
     }
-    let c_q = into_contiguous_cube(q)?;
-    let c_k = into_contiguous_cube(k)?;
-    let c_v = into_contiguous_cube(v)?;
-    let out = launch_sdpa_window::<F>(
-        ctx.client(),
-        c_q.handle,
-        c_k.handle,
-        c_v.handle,
-        None,
-        batches,
-        num_heads,
-        n_tokens,
-        head_dim,
+}
+
+/// [`run_unmasked_sdpa`] on contiguous handles of `[batches, heads, n_tokens, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_unmasked_sdpa_handles<F: CkFloat>(
+    ctx: &MlContext,
+    q: Handle,
+    k: Handle,
+    v: Handle,
+    batches: usize,
+    heads: usize,
+    n_tokens: usize,
+    head_dim: usize,
+) -> CkResult<Handle> {
+    let shape = [batches, heads, n_tokens, head_dim];
+    let dt = elem_dtype::<F>();
+    let out = run_unmasked_sdpa::<F>(
+        ctx,
+        ctx.tensor_from_handle(q, shape, dt),
+        ctx.tensor_from_handle(k, shape, dt),
+        ctx.tensor_from_handle(v, shape, dt),
     )?;
-    Ok(ctx.tensor_from_handle(
-        out,
-        [batches, num_heads, n_tokens, head_dim],
-        elem_dtype::<F>(),
-    ))
+    Ok(into_contiguous_cube(out)?.handle)
+}
+
+/// Contiguous `q`, `k`, `v` of one unmasked SDPA call.
+#[derive(Clone, Debug)]
+struct SdpaInputs {
+    /// `[batches, num_heads, n_tokens, head_dim]`.
+    dims: [usize; 4],
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+}
+
+impl SdpaInputs {
+    /// Our kernel ([`launch_attention`]), dispatched on the tensors' run-time dtype: the tune set is built once per
+    /// device and shared by every element type, so candidates must not capture a type parameter.
+    fn run_own_kernel(self) -> Result<CubeTensor, String> {
+        let [batches, heads, tokens, head_dim] = self.dims;
+        let launch = match self.q.dtype {
+            DType::F32 => launch_attention::<f32>,
+            DType::F16 => launch_attention::<f16>,
+            other => return Err(format!("sdpa_window_kernel: unsupported dtype {other:?}")),
+        };
+        let out = launch(
+            &self.q.client,
+            self.q.handle.clone(),
+            self.k.handle.clone(),
+            self.v.handle.clone(),
+            None,
+            batches,
+            heads,
+            tokens,
+            head_dim,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(CubeTensor::new_contiguous(
+            self.q.client.clone(),
+            self.q.device.clone(),
+            Shape::from(self.dims),
+            out,
+            self.q.dtype,
+        ))
+    }
+
+    fn run_cubek_flash(self, num_planes: u8) -> Result<CubeTensor, String> {
+        let strategy = AttentionStrategy::FlashBlackboxAccelerated(BlackboxAcceleratedStrategy {
+            num_planes,
+            seq_q: 1,
+            seq_kv: 1,
+        });
+        cube_attention(self.q, self.k, self.v, None, None, AttentionModuleOptions::default(), strategy)
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// Environment variable restricting attention to our kernel (`own`); unset: autotuned candidates.
+pub const ATTENTION_ENV: &str = "CORRIDORKEY_ATTENTION";
+
+fn tuned_sdpa(ctx: &MlContext, inputs: SdpaInputs) -> CubeTensor {
+    static TUNER: LocalTuner<String, String> = local_tuner!("corridorkey-sdpa");
+    let client = ctx.client().clone();
+    let id = tune_id(&client);
+    let has_f16_cmma = {
+        let f16 = <f16 as Scalar>::elem_type_native();
+        client.properties().features.matmul.cmma.iter().any(|c| c.a_type == f16 && c.b_type == f16)
+    };
+    // `CORRIDORKEY_ATTENTION=own`: our kernel only (cubek flash keeps more of its work in f16).
+    // Part of the tune id, so each candidate set keeps its own persisted decisions.
+    let own_only = std::env::var(ATTENTION_ENV).is_ok_and(|v| v.trim() == "own");
+    let id = if own_only { format!("{id}-own") } else { id };
+    let has_f16_cmma = has_f16_cmma && !own_only;
+    let set = TUNER.init(&id, move || {
+        let key = |i: &SdpaInputs| {
+            let [batches, heads, tokens, head_dim] = i.dims;
+            format!("{:?}-bh{}-n{tokens}-d{head_dim}", i.q.dtype, size_class(batches * heads))
+        };
+        let mut set: TunableSet<String, SdpaInputs, CubeTensor> = TunableSet::new_cloning_inputs(key)
+            .with(Tunable::new("rows-kernel", SdpaInputs::run_own_kernel));
+        if has_f16_cmma {
+            for planes in [2u8, 4, 8] {
+                set = set.with(Tunable::new(&format!("cubek-flash-{planes}-planes"), move |i: SdpaInputs| {
+                    i.run_cubek_flash(planes)
+                }));
+            }
+        }
+        set
+    });
+    TUNER.execute(&id, &client, set, inputs)
+}
+
+/// Work per cube for the per-`(token, head)` prep kernels (`prep_*_qkv*`): one unit per
+/// `(2p, 2p + 1)` pair of the head, rounded up to a power of two so the runtime's cube
+/// ([`LaunchGeometry::per_row`] rounds down) still covers every pair.
+pub fn pair_units(head_dim: usize) -> usize {
+    (head_dim / 2).max(1).next_power_of_two()
 }
 
 /// Shared device-resident weights for `FullSpatialAttention2D`, `SwinAttention2D`,
@@ -116,19 +247,18 @@ impl AttentionCore {
             || proj_w.len() != dim * dim
             || proj_b.len() != dim
         {
-            return Err(CkError::Shape("AttentionCore weight/bias shape mismatch".into()));
+            return Err(CkError::Shape(
+                "AttentionCore weight/bias shape mismatch".into(),
+            ));
         }
-        let qkv_wt = transpose_2d(qkv_w, c3, dim);
-        let gate_wt = transpose_2d(gate_w, num_heads, dim);
-        let proj_wt = transpose_2d(proj_w, dim, dim);
         Ok(Self {
-            qkv_w_t: ctx.upload_tensor(&qkv_wt, [dim, c3])?,
+            qkv_w_t: ctx.upload_transposed(qkv_w, c3, dim)?,
             qkv_b: upload(ctx.client(), qkv_b),
             qkv_dw,
             q_norm_w: upload(ctx.client(), q_norm_w),
             k_norm_w: upload(ctx.client(), k_norm_w),
-            gate_w_t: ctx.upload_tensor(&gate_wt, [dim, num_heads])?,
-            proj_w_t: ctx.upload_tensor(&proj_wt, [dim, dim])?,
+            gate_w_t: ctx.upload_transposed(gate_w, num_heads, dim)?,
+            proj_w_t: ctx.upload_transposed(proj_w, dim, dim)?,
             proj_b: upload(ctx.client(), proj_b),
             dim,
             num_heads,
@@ -136,14 +266,14 @@ impl AttentionCore {
         })
     }
 
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         prefix: &str,
         num_heads: usize,
     ) -> CkResult<Self> {
-        let (qkv_shape, qkv_w) = st.read_f32(&format!("{prefix}.qkv.qkv.weight"))?;
-        let (_, qkv_b) = st.read_f32(&format!("{prefix}.qkv.qkv.bias"))?;
+        let (qkv_shape, qkv_w) = st.read_as::<F>(&format!("{prefix}.qkv.qkv.weight"))?;
+        let (_, qkv_b) = st.read_as::<F>(&format!("{prefix}.qkv.qkv.bias"))?;
         if qkv_shape.len() != 2 || qkv_shape[0] != 3 * qkv_shape[1] {
             return Err(CkError::Weights(format!(
                 "unexpected QKV weight shape {qkv_shape:?} at '{prefix}'"
@@ -152,15 +282,15 @@ impl AttentionCore {
         let dim = qkv_shape[1];
         let dw_prefix = format!("{prefix}.qkv_dw");
         let qkv_dw = if st.entry(&format!("{dw_prefix}.dw.weight")).is_ok() {
-            Some(QkvDepthwiseSpatial::load(ctx, st, &dw_prefix)?)
+            Some(QkvDepthwiseSpatial::load::<F>(ctx, st, &dw_prefix)?)
         } else {
             None
         };
-        let (_, q_norm_w) = st.read_f32(&format!("{prefix}.q_norm.weight"))?;
-        let (_, k_norm_w) = st.read_f32(&format!("{prefix}.k_norm.weight"))?;
-        let (_, gate_w) = st.read_f32(&format!("{prefix}.attn_gate.proj.weight"))?;
-        let (_, proj_w) = st.read_f32(&format!("{prefix}.proj.weight"))?;
-        let (_, proj_b) = st.read_f32(&format!("{prefix}.proj.bias"))?;
+        let (_, q_norm_w) = st.read_as::<F>(&format!("{prefix}.q_norm.weight"))?;
+        let (_, k_norm_w) = st.read_as::<F>(&format!("{prefix}.k_norm.weight"))?;
+        let (_, gate_w) = st.read_as::<F>(&format!("{prefix}.attn_gate.proj.weight"))?;
+        let (_, proj_w) = st.read_as::<F>(&format!("{prefix}.proj.weight"))?;
+        let (_, proj_b) = st.read_as::<F>(&format!("{prefix}.proj.bias"))?;
         Self::from_slices(
             ctx, dim, num_heads, &qkv_w, &qkv_b, qkv_dw, &q_norm_w, &k_norm_w, &gate_w, &proj_w,
             &proj_b,
@@ -207,7 +337,9 @@ impl AttentionCore {
         let q_h = empty::<F>(ctx.client(), total_elems);
         let k_h = empty::<F>(ctx.client(), total_elems);
         let v_h = empty::<F>(ctx.client(), total_elems);
-        let geom = LaunchGeometry::elementwise(ctx.client(), total_bhn);
+        let geom = LaunchGeometry::per_row(ctx.client(), total_bhn, pair_units(self.head_dim));
+        let block_size = geom.cube_dim.x;
+        assert!(block_size as usize * 2 >= self.head_dim, "prep cube of {block_size} units < head_dim / 2");
         unsafe {
             prep_qkv_norm_rope_kernel::launch::<F>(
                 ctx.client(),
@@ -227,7 +359,8 @@ impl AttentionCore {
                 n_tokens as u32,
                 self.head_dim as u32,
                 u32::from(!bias_already_applied),
-                corridorkey_base::core::cast::<F>(DEFAULT_RMS_NORM_EPS),
+                DEFAULT_RMS_NORM_EPS as f32,
+                block_size,
             );
         }
         let shape = [batches, self.num_heads, n_tokens, self.head_dim];
@@ -272,8 +405,7 @@ impl AttentionCore {
                 self.head_dim as u32,
             );
         }
-        let merged_2d =
-            ctx.tensor_from_handle(merged, [total_tokens, self.dim], elem_dtype::<F>());
+        let merged_2d = ctx.tensor_from_handle(merged, [total_tokens, self.dim], elem_dtype::<F>());
         let proj_2d = ctx.matmul(merged_2d, self.proj_w_t.clone());
         let c_proj = into_contiguous_cube(proj_2d)?;
         unsafe {
@@ -336,12 +468,20 @@ impl ShiftedRegionGroups {
         shift_w: usize,
     ) -> Self {
         let h_ranges: Vec<(usize, usize)> = if shift_h > 0 {
-            vec![(0, hp - win_size), (hp - win_size, hp - shift_h), (hp - shift_h, hp)]
+            vec![
+                (0, hp - win_size),
+                (hp - win_size, hp - shift_h),
+                (hp - shift_h, hp),
+            ]
         } else {
             vec![(0, hp)]
         };
         let w_ranges: Vec<(usize, usize)> = if shift_w > 0 {
-            vec![(0, wp - win_size), (wp - win_size, wp - shift_w), (wp - shift_w, wp)]
+            vec![
+                (0, wp - win_size),
+                (wp - win_size, wp - shift_w),
+                (wp - shift_w, wp),
+            ]
         } else {
             vec![(0, wp)]
         };
@@ -412,7 +552,10 @@ impl ShiftedRegionGroups {
                                     tok_tuple.push((ti * spatial_tokens + si) as u32);
                                 }
                             }
-                            groups_map.entry(tok_tuple).or_default().push(win_idx as u32);
+                            groups_map
+                                .entry(tok_tuple)
+                                .or_default()
+                                .push(win_idx as u32);
                         }
                     }
                 }
@@ -456,7 +599,7 @@ impl ShiftedRegionGroups {
         let c_k = into_contiguous_cube(k)?;
         let c_v = into_contiguous_cube(v)?;
         let reg_h = self.get_or_upload_table(ctx);
-        let out_handle = launch_sdpa_window::<F>(
+        let out_handle = launch_attention::<F>(
             ctx.client(),
             c_q.handle,
             c_k.handle,

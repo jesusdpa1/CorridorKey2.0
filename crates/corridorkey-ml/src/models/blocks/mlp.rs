@@ -16,9 +16,7 @@ use cubecl::server::Handle;
 use crate::hub::SafetensorsFile;
 use crate::runtime::{MlContext, elem_dtype, into_contiguous_cube};
 
-use super::kernels::{
-    add_row_bias_kernel, add_row_bias_residual_kernel, swiglu_gate_fused_kernel,
-};
+use super::kernels::{add_row_bias_kernel, add_row_bias_residual_kernel, swiglu_gate_fused_kernel};
 
 /// Transposes a row-major `[rows, cols]` slice on the host into `[cols, rows]`.
 pub fn transpose_2d<T: Copy>(data: &[T], rows: usize, cols: usize) -> Vec<T> {
@@ -63,7 +61,10 @@ impl SwiGlu {
         w_down: &[F],
         b_down: &[F],
     ) -> CkResult<Self> {
-        if w_gate.len() != hidden * dim || w_up.len() != hidden * dim || w_down.len() != dim * hidden {
+        if w_gate.len() != hidden * dim
+            || w_up.len() != hidden * dim
+            || w_down.len() != dim * hidden
+        {
             return Err(CkError::Shape(format!(
                 "SwiGlu weight length mismatch for dim={dim}, hidden={hidden}"
             )));
@@ -76,14 +77,12 @@ impl SwiGlu {
         let mut w_gate_up = Vec::with_capacity(2 * hidden * dim);
         w_gate_up.extend_from_slice(w_gate);
         w_gate_up.extend_from_slice(w_up);
-        let w_gate_up_t = transpose_2d(&w_gate_up, 2 * hidden, dim);
-        let w_down_t = transpose_2d(w_down, dim, hidden);
 
         Ok(Self {
-            w_gate_up_t: ctx.upload_tensor(&w_gate_up_t, [dim, 2 * hidden])?,
+            w_gate_up_t: ctx.upload_transposed(&w_gate_up, 2 * hidden, dim)?,
             b_gate: upload(ctx.client(), b_gate),
             b_up: upload(ctx.client(), b_up),
-            w_down_t: ctx.upload_tensor(&w_down_t, [hidden, dim])?,
+            w_down_t: ctx.upload_transposed(w_down, dim, hidden)?,
             b_down: upload(ctx.client(), b_down),
             dim,
             hidden,
@@ -91,20 +90,22 @@ impl SwiGlu {
     }
 
     /// Loads `<prefix>.w_{gate,up,down}.{weight,bias}` from a [`SafetensorsFile`] onto `ctx`.
-    pub fn load(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
-        let (gate_shape, w_gate) = st.read_f32(&format!("{prefix}.w_gate.weight"))?;
-        let (_, b_gate) = st.read_f32(&format!("{prefix}.w_gate.bias"))?;
-        let (_, w_up) = st.read_f32(&format!("{prefix}.w_up.weight"))?;
-        let (_, b_up) = st.read_f32(&format!("{prefix}.w_up.bias"))?;
-        let (_, w_down) = st.read_f32(&format!("{prefix}.w_down.weight"))?;
-        let (_, b_down) = st.read_f32(&format!("{prefix}.w_down.bias"))?;
+    pub fn load<F: CkFloat>(ctx: &MlContext, st: &SafetensorsFile, prefix: &str) -> CkResult<Self> {
+        let (gate_shape, w_gate) = st.read_as::<F>(&format!("{prefix}.w_gate.weight"))?;
+        let (_, b_gate) = st.read_as::<F>(&format!("{prefix}.w_gate.bias"))?;
+        let (_, w_up) = st.read_as::<F>(&format!("{prefix}.w_up.weight"))?;
+        let (_, b_up) = st.read_as::<F>(&format!("{prefix}.w_up.bias"))?;
+        let (_, w_down) = st.read_as::<F>(&format!("{prefix}.w_down.weight"))?;
+        let (_, b_down) = st.read_as::<F>(&format!("{prefix}.w_down.bias"))?;
         if gate_shape.len() != 2 {
             return Err(CkError::Weights(format!(
                 "expected 2D w_gate.weight at '{prefix}', got {gate_shape:?}"
             )));
         }
         let (hidden, dim) = (gate_shape[0], gate_shape[1]);
-        Self::from_slices(ctx, dim, hidden, &w_gate, &b_gate, &w_up, &b_up, &w_down, &b_down)
+        Self::from_slices(
+            ctx, dim, hidden, &w_gate, &b_gate, &w_up, &b_up, &w_down, &b_down,
+        )
     }
 
     pub fn dim(&self) -> usize {
@@ -253,7 +254,9 @@ mod tests {
     fn swiglu_matches_f64_reference() {
         let (num_rows, dim, hidden) = (7, 16, 40);
         let make_vec = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * seed + 0.1).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i as f32) * seed + 0.1).sin() * 0.3)
+                .collect()
         };
         let x32 = make_vec(num_rows * dim, 0.17);
         let wg32 = make_vec(hidden * dim, 0.11);
@@ -279,7 +282,9 @@ mod tests {
 
         for target in ComputeTarget::available() {
             let ctx = MlContext::new(target).unwrap();
-            let mlp = SwiGlu::from_slices(&ctx, dim, hidden, &wg32, &bg32, &wu32, &bu32, &wd32, &bd32).unwrap();
+            let mlp =
+                SwiGlu::from_slices(&ctx, dim, hidden, &wg32, &bg32, &wu32, &bu32, &wd32, &bd32)
+                    .unwrap();
             let t_in = ctx.upload_tensor(&x32, [num_rows, dim]).unwrap();
             let t_out = mlp.forward::<f32, 2>(&ctx, t_in).unwrap();
             let got = ctx.download_tensor::<f32, 2>(t_out).unwrap();

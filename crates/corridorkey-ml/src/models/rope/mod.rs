@@ -6,7 +6,7 @@
 pub mod kernels;
 
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     f64::consts::PI,
     sync::{Arc, Mutex},
 };
@@ -14,8 +14,11 @@ use std::{
 use corridorkey_base::core::{CkFloat, buffer::upload};
 use corridorkey_core::compute::LaunchGeometry;
 use corridorkey_core::{CkError, CkResult};
+use cubecl::device::DeviceId;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+
+use crate::runtime::MlContext;
 
 use kernels::apply_rotary_kernel;
 
@@ -59,8 +62,9 @@ fn axis_cos_sin(coords: &[f64], periods: &[f64]) -> (Vec<f64>, Vec<f64>) {
     (cos, sin)
 }
 
-type Rope2dCache = Arc<Mutex<BTreeMap<(usize, usize, usize), (Handle, Handle)>>>;
-type Rope3dCache = Arc<Mutex<BTreeMap<(usize, usize, usize, u64, usize), (Handle, Handle)>>>;
+type Rope2dCache = Arc<Mutex<HashMap<(DeviceId, usize, usize, usize), (Handle, Handle)>>>;
+type Rope3dCache =
+    Arc<Mutex<HashMap<(DeviceId, usize, usize, usize, u64, usize), (Handle, Handle)>>>;
 
 /// 2D Rotary Position Embedding (`RoPE2D` in `corridorkey/rope.py`) for Stage 2 spatial blocks.
 #[derive(Debug, Clone)]
@@ -85,7 +89,7 @@ impl Rope2d {
             base,
             periods_h: compute_periods(dim_each, base),
             periods_w: compute_periods(dim_each, base),
-            cache: Arc::new(Mutex::new(BTreeMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -98,20 +102,23 @@ impl Rope2d {
     }
 
     /// Returns device-resident `(cos, sin)` handles for `(num_h, num_w)`, building and uploading
-    /// once per shape/dtype and reusing across subsequent calls.
+    /// once per device/shape/dtype and reusing across subsequent calls.
     pub fn cos_sin_handles<F: CkFloat>(
         &self,
-        client: &Client,
+        ctx: &MlContext,
         num_h: usize,
         num_w: usize,
     ) -> (Handle, Handle) {
-        let key = (num_h, num_w, size_of::<F>());
+        let key = (ctx.device_id(), num_h, num_w, size_of::<F>());
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pair) = guard.get(&key) {
             return pair.clone();
         }
         let (cos_vec, sin_vec) = self.tables::<F>(num_h, num_w);
-        let pair = (upload(client, &cos_vec), upload(client, &sin_vec));
+        let pair = (
+            upload(ctx.client(), &cos_vec),
+            upload(ctx.client(), &sin_vec),
+        );
         guard.insert(key, pair.clone());
         pair
     }
@@ -184,27 +191,37 @@ impl Rope3d {
             periods_t: compute_periods(pairs_t * 2, base),
             periods_h: compute_periods(pairs_h * 2, base),
             periods_w: compute_periods(pairs_w * 2, base),
-            cache: Arc::new(Mutex::new(BTreeMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Returns device-resident `(cos, sin)` handles for `(num_t, num_h, num_w, t_stride)`,
-    /// building and uploading once per configuration and reusing across subsequent calls.
+    /// building and uploading once per device/configuration and reusing across subsequent calls.
     pub fn cos_sin_handles<F: CkFloat>(
         &self,
-        client: &Client,
+        ctx: &MlContext,
         num_t: usize,
         num_h: usize,
         num_w: usize,
         t_stride: f64,
     ) -> (Handle, Handle) {
-        let key = (num_t, num_h, num_w, t_stride.to_bits(), size_of::<F>());
+        let key = (
+            ctx.device_id(),
+            num_t,
+            num_h,
+            num_w,
+            t_stride.to_bits(),
+            size_of::<F>(),
+        );
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pair) = guard.get(&key) {
             return pair.clone();
         }
         let (cos_vec, sin_vec) = self.tables::<F>(num_t, num_h, num_w, t_stride);
-        let pair = (upload(client, &cos_vec), upload(client, &sin_vec));
+        let pair = (
+            upload(ctx.client(), &cos_vec),
+            upload(ctx.client(), &sin_vec),
+        );
         guard.insert(key, pair.clone());
         pair
     }
@@ -229,13 +246,20 @@ impl Rope3d {
         num_w: usize,
         t_stride: f64,
     ) -> (Vec<f64>, Vec<f64>) {
-        let coord_t: Vec<f64> = normalized_coords(num_t).into_iter().map(|c| c * t_stride).collect();
+        let coord_t: Vec<f64> = normalized_coords(num_t)
+            .into_iter()
+            .map(|c| c * t_stride)
+            .collect();
         let coord_h = normalized_coords(num_h);
         let coord_w = normalized_coords(num_w);
         let (cos_t, sin_t) = axis_cos_sin(&coord_t, &self.periods_t);
         let (cos_h, sin_h) = axis_cos_sin(&coord_h, &self.periods_h);
         let (cos_w, sin_w) = axis_cos_sin(&coord_w, &self.periods_w);
-        let (pt, ph, pw) = (self.periods_t.len(), self.periods_h.len(), self.periods_w.len());
+        let (pt, ph, pw) = (
+            self.periods_t.len(),
+            self.periods_h.len(),
+            self.periods_w.len(),
+        );
         let half = pt + ph + pw;
         let n = num_t * num_h * num_w;
         let mut cos = Vec::with_capacity(n * half);
@@ -324,7 +348,14 @@ mod tests {
     use corridorkey_base::core::buffer::{download, empty, upload};
     use corridorkey_core::ComputeTarget;
 
-    fn host_apply_rotary(x: &[f64], cos: &[f64], sin: &[f64], batches: usize, n_tokens: usize, head_dim: usize) -> Vec<f64> {
+    fn host_apply_rotary(
+        x: &[f64],
+        cos: &[f64],
+        sin: &[f64],
+        batches: usize,
+        n_tokens: usize,
+        head_dim: usize,
+    ) -> Vec<f64> {
         let half = head_dim / 2;
         let table_pairs = n_tokens * half;
         let mut out = vec![0.0; x.len()];
@@ -370,10 +401,16 @@ mod tests {
             let d_cos = upload(&client, &cos32);
             let d_sin = upload(&client, &sin32);
             let d_out = empty::<f32>(&client, len);
-            apply_rotary::<f32>(&client, &d_x, &d_cos, &d_sin, &d_out, batches, n_tokens, head_dim);
+            apply_rotary::<f32>(
+                &client, &d_x, &d_cos, &d_sin, &d_out, batches, n_tokens, head_dim,
+            );
             let got: Vec<f32> = download(&client, d_out);
             for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
-                assert!((g as f64 - w).abs() < 1e-6, "{} [{i}]: {g} vs {w}", client.name());
+                assert!(
+                    (g as f64 - w).abs() < 1e-6,
+                    "{} [{i}]: {g} vs {w}",
+                    client.name()
+                );
             }
         }
     }

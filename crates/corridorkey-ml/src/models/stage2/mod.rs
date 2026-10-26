@@ -13,15 +13,15 @@ use corridorkey_base::core::CkFloat;
 use corridorkey_core::{CkError, CkResult};
 
 use crate::{
+    Provenance,
     hub::{ModelConfig, SafetensorsFile},
     models::{
         blocks::{
-            CSwinBlock2d, Depatchify, FullSpatialBlock2d, GatedRgbSkip, PatchifyConv, Stage2Block2d,
-            SwinBlock2d,
+            CSwinBlock2d, Depatchify, FullSpatialBlock2d, GatedRgbSkip, PatchifyConv,
+            Stage2Block2d, SwinBlock2d,
         },
         rope::Rope2d,
     },
-    Provenance,
     provenance::corridorkey_v2_provenance,
     runtime::MlContext,
 };
@@ -51,7 +51,7 @@ impl Stage2 {
     }
 
     /// Loads `Stage2` weights from `SafetensorsFile` under `prefix` (typically `"stage2"`).
-    pub fn load(
+    pub fn load<F: CkFloat>(
         ctx: &MlContext,
         st: &SafetensorsFile,
         cfg: &ModelConfig,
@@ -65,9 +65,12 @@ impl Stage2 {
         let head_dim = d / num_heads;
         let rope = Rope2d::new(head_dim, cfg.rope_base)?;
 
-        let patch_1 = PatchifyConv::load(ctx, st, &format!("{prefix}.patch_1"), STAGE2_PATCH_SIZE)?;
+        let patch_1 =
+            PatchifyConv::load::<F>(ctx, st, &format!("{prefix}.patch_1"), STAGE2_PATCH_SIZE)?;
 
-        let num_pre = cfg.n_blocks_stage2.saturating_sub(cfg.n_final_blocks_stage2);
+        let num_pre = cfg
+            .n_blocks_stage2
+            .saturating_sub(cfg.n_final_blocks_stage2);
         let pre_specs: &[(&str, (usize, usize))] = match num_pre {
             8 => &[
                 ("full", (0, 0)),
@@ -98,14 +101,14 @@ impl Stage2 {
         for (i, &(kind, shift)) in pre_specs.iter().enumerate() {
             let blk_prefix = format!("{prefix}.pre_blocks.{i}");
             let blk = match kind {
-                "full" => Stage2Block2d::Full(FullSpatialBlock2d::load(
+                "full" => Stage2Block2d::Full(FullSpatialBlock2d::load::<F>(
                     ctx,
                     st,
                     &blk_prefix,
                     num_heads,
                     rope.clone(),
                 )?),
-                "swin" => Stage2Block2d::Swin(SwinBlock2d::load(
+                "swin" => Stage2Block2d::Swin(SwinBlock2d::load::<F>(
                     ctx,
                     st,
                     &blk_prefix,
@@ -114,7 +117,7 @@ impl Stage2 {
                     shift,
                     rope.clone(),
                 )?),
-                "cswin" => Stage2Block2d::CSwin(CSwinBlock2d::load(
+                "cswin" => Stage2Block2d::CSwin(CSwinBlock2d::load::<F>(
                     ctx,
                     st,
                     &blk_prefix,
@@ -127,7 +130,7 @@ impl Stage2 {
         }
 
         let patch_2_skip = if st.entry(&format!("{prefix}.patch_2.conv.weight")).is_ok() {
-            Some(GatedRgbSkip::load(
+            Some(GatedRgbSkip::load::<F>(
                 ctx,
                 st,
                 prefix,
@@ -143,7 +146,7 @@ impl Stage2 {
         let mut final_blocks = Vec::with_capacity(final_shifts.len());
         for (i, &shift) in final_shifts.iter().enumerate() {
             let blk_prefix = format!("{prefix}.final_blocks.{i}");
-            final_blocks.push(Stage2Block2d::Swin(SwinBlock2d::load(
+            final_blocks.push(Stage2Block2d::Swin(SwinBlock2d::load::<F>(
                 ctx,
                 st,
                 &blk_prefix,
@@ -154,12 +157,8 @@ impl Stage2 {
             )?));
         }
 
-        let depatchify = Depatchify::load(
-            ctx,
-            st,
-            &format!("{prefix}.depatchify"),
-            STAGE2_PATCH_SIZE,
-        )?;
+        let depatchify =
+            Depatchify::load::<F>(ctx, st, &format!("{prefix}.depatchify"), STAGE2_PATCH_SIZE)?;
 
         Ok(Self {
             patch_1,
@@ -182,7 +181,9 @@ impl Stage2 {
         baton_nhwc: Tensor<4>,
     ) -> CkResult<Tensor<4>> {
         let [bt, h, w, c_rgb] = rgb_nhwc.dims();
-        if c_rgb != 3 || !h.is_multiple_of(STAGE2_PATCH_SIZE) || !w.is_multiple_of(STAGE2_PATCH_SIZE)
+        if c_rgb != 3
+            || !h.is_multiple_of(STAGE2_PATCH_SIZE)
+            || !w.is_multiple_of(STAGE2_PATCH_SIZE)
         {
             return Err(CkError::Shape(format!(
                 "Stage2::forward expects rgb_nhwc [BT, H, W, 3] with /16-aligned H, W; got [{bt}, {h}, {w}, {c_rgb}]"
@@ -227,7 +228,10 @@ impl Stage2 {
         let d_p1 = time_device(ctx.client(), 3, || {
             let _ = self.patch_1.forward::<F>(ctx, rgb_nhwc.clone()).unwrap();
         });
-        println!("    Stage 2 patch_1 (patchify):                {:6.2} ms", d_p1.as_secs_f64() * 1e3);
+        println!(
+            "    Stage 2 patch_1 (patchify):                {:6.2} ms",
+            d_p1.as_secs_f64() * 1e3
+        );
 
         let rgb_feat = self.patch_1.forward::<F>(ctx, rgb_nhwc.clone())?;
         let x_in = Tensor::cat(vec![baton_nhwc, rgb_feat], 3);
@@ -238,7 +242,11 @@ impl Stage2 {
                 x = blk.forward::<F>(ctx, x).unwrap();
             }
         });
-        println!("    Stage 2 pre_blocks (8 blocks):             {:6.2} ms ({:.2} ms/blk)", d_pre.as_secs_f64() * 1e3, (d_pre.as_secs_f64() * 1e3) / self.pre_blocks.len() as f64);
+        println!(
+            "    Stage 2 pre_blocks (8 blocks):             {:6.2} ms ({:.2} ms/blk)",
+            d_pre.as_secs_f64() * 1e3,
+            (d_pre.as_secs_f64() * 1e3) / self.pre_blocks.len() as f64
+        );
         let mut x = x_in;
         for blk in &self.pre_blocks {
             x = blk.forward::<F>(ctx, x)?;
@@ -248,7 +256,10 @@ impl Stage2 {
             let d_skip = time_device(ctx.client(), 3, || {
                 let _ = skip.forward::<F>(ctx, x.clone(), rgb_nhwc.clone()).unwrap();
             });
-            println!("    Stage 2 patch_2_skip:                      {:6.2} ms", d_skip.as_secs_f64() * 1e3);
+            println!(
+                "    Stage 2 patch_2_skip:                      {:6.2} ms",
+                d_skip.as_secs_f64() * 1e3
+            );
             x = skip.forward::<F>(ctx, x, rgb_nhwc)?;
         }
 
@@ -258,7 +269,11 @@ impl Stage2 {
                 xf = blk.forward::<F>(ctx, xf).unwrap();
             }
         });
-        println!("    Stage 2 final_blocks (2 Swin blocks):      {:6.2} ms ({:.2} ms/blk)", d_final.as_secs_f64() * 1e3, (d_final.as_secs_f64() * 1e3) / self.final_blocks.len() as f64);
+        println!(
+            "    Stage 2 final_blocks (2 Swin blocks):      {:6.2} ms ({:.2} ms/blk)",
+            d_final.as_secs_f64() * 1e3,
+            (d_final.as_secs_f64() * 1e3) / self.final_blocks.len() as f64
+        );
         for blk in &self.final_blocks {
             x = blk.forward::<F>(ctx, x)?;
         }
@@ -266,7 +281,10 @@ impl Stage2 {
         let d_depatch = time_device(ctx.client(), 3, || {
             let _ = self.depatchify.forward::<F>(ctx, x.clone()).unwrap();
         });
-        println!("    Stage 2 depatchify (16x pixel shuffle):    {:6.2} ms", d_depatch.as_secs_f64() * 1e3);
+        println!(
+            "    Stage 2 depatchify (16x pixel shuffle):    {:6.2} ms",
+            d_depatch.as_secs_f64() * 1e3
+        );
         Ok(())
     }
 }
@@ -288,7 +306,7 @@ mod tests {
 
         for target in ComputeTarget::available() {
             let ctx = MlContext::new(target).unwrap();
-            let stage2 = Stage2::load(&ctx, &st, &header.model_config, "stage2").unwrap();
+            let stage2 = Stage2::load::<f32>(&ctx, &st, &header.model_config, "stage2").unwrap();
 
             let (bt, h, w) = (1, 128, 128);
             let h16 = h / STAGE2_PATCH_SIZE;
@@ -301,11 +319,16 @@ mod tests {
                 .collect();
 
             let t_rgb = ctx.upload_tensor(&rgb, [bt, h, w, 3]).unwrap();
-            let t_baton = ctx.upload_tensor(&baton, [bt, h16, w16, stage2.d_baton]).unwrap();
+            let t_baton = ctx
+                .upload_tensor(&baton, [bt, h16, w16, stage2.d_baton])
+                .unwrap();
             let t_out = stage2.forward::<f32>(&ctx, t_rgb, t_baton).unwrap();
             assert_eq!(t_out.dims(), [bt, h, w, STAGE2_OUT_CHANNELS]);
             let out = ctx.download_tensor::<f32, 4>(t_out).unwrap();
-            assert!(out.iter().all(|v| v.is_finite()), "{target} Stage2 output had non-finite values");
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "{target} Stage2 output had non-finite values"
+            );
         }
     }
 }
