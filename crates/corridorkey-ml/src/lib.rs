@@ -3,10 +3,13 @@
 //! - [`provenance`]: paper, code, license and weights attribution (`Attributed`).
 //! - [`hub`]: `.safetensors` header/offset reader, `ModelConfig` and `FoundationStats`.
 //! - [`runtime`]: zero-copy bridge between `ComputeTarget`, CubeCL `Handle`s and Burn `Tensor`s.
-//! - [`models`]: rotary embeddings (`rope`), transformer building blocks (`blocks`), and stages.
+//! - [`models`]: rotary embeddings (`rope`), transformer building blocks (`blocks`), stages and the
+//!   frozen backbones (`foundations`).
+//! - [`pipeline`]: keying a clip on the device (`Keyer`), decoder / encoder behind traits.
 
 pub mod hub;
 pub mod models;
+pub mod pipeline;
 pub mod provenance;
 pub mod runtime;
 
