@@ -27,7 +27,10 @@ as `initial_hint_path` / `hint_video_path`; their values as read by the product 
 `hint_first.f32` (`[h, w]`) and `hints.f32` (`[T, h, w]`). The mattes are rough green-difference
 keys of the frames, enough to exercise every hint path.
 
-usage: pipeline_reference.py <out_dir> [--exr-linear] [--hints]
+With `--hints-exr`: the same hints as EXR files, the hint frames at 3/4 of the frames' size and in
+float (they go through the product's EXR reader, float gray conversion and Lanczos resize).
+
+usage: pipeline_reference.py <out_dir> [--exr-linear] [--hints | --hints-exr]
 """
 
 from __future__ import annotations
@@ -77,23 +80,35 @@ def rough_matte(frame_bgr: np.ndarray) -> np.ndarray:
     return (cv2.GaussianBlur(alpha, (0, 0), 3.0) * 255.0 + 0.5).astype(np.uint8)
 
 
-def write_hints(out: Path, frames_bgr: list[np.ndarray]) -> tuple[str, str]:
+def write_hints(out: Path, frames_bgr: list[np.ndarray], *, exr: bool) -> tuple[str, str]:
     """Writes the hint inputs and the values the product reads from them (see the module docs)."""
     mattes = [rough_matte(f) for f in frames_bgr]
-    first = out / "hint_first.png"
-    # BGRA with the matte in alpha and noise in B: `read_hint_image` must pick alpha
     noise = np.random.default_rng(1).integers(0, 256, mattes[0].shape, dtype=np.uint8)
-    cv2.imwrite(str(first), np.dstack([noise, noise, noise, mattes[0]]))
     hint_dir = out / "hints"
     hint_dir.mkdir(exist_ok=True)
-    for i, m in enumerate(mattes):
-        # Unequal channels, so the gray conversion matters
-        bgr = np.dstack([m // 2, m, np.minimum(m.astype(np.uint16) + 20, 255).astype(np.uint8)])
-        cv2.imwrite(str(hint_dir / f"{i:04d}.png"), bgr)
+    if exr:
+        # BGRA float with the matte in alpha and noise in the color: `read_hint_image` must pick alpha
+        first = out / "hint_first.exr"
+        n = noise.astype(np.float32) / 255.0
+        exr_io.write_exr(first, np.dstack([n, n, n, mattes[0].astype(np.float32) / 255.0]), half=False)
+        h, w = mattes[0].shape
+        small = (w * 3 // 4, h * 3 // 4)
+        for i, m in enumerate(mattes):
+            # Unequal float channels at 3/4 size: gray conversion and Lanczos resize both matter
+            m = cv2.resize(m.astype(np.float32) / 255.0, small, interpolation=cv2.INTER_AREA)
+            exr_io.write_exr(hint_dir / f"{i:04d}.exr", np.dstack([m * 0.5, m, np.minimum(m + 0.08, 1.2)]), half=False)
+    else:
+        first = out / "hint_first.png"
+        # BGRA with the matte in alpha and noise in B: `read_hint_image` must pick alpha
+        cv2.imwrite(str(first), np.dstack([noise, noise, noise, mattes[0]]))
+        for i, m in enumerate(mattes):
+            # Unequal channels, so the gray conversion matters
+            bgr = np.dstack([m // 2, m, np.minimum(m.astype(np.uint16) + 20, 255).astype(np.uint8)])
+            cv2.imwrite(str(hint_dir / f"{i:04d}.png"), bgr)
     video_io.read_hint_image(first).astype(np.float32).tofile(out / "hint_first.f32")
     meta = {"shape_hw": frames_bgr[0].shape[:2], "model_native_hw": frames_bgr[0].shape[:2]}
-    hints = [video_io.preprocess_hint_frame(cv2.imread(str(p), cv2.IMREAD_UNCHANGED), meta)[0].float().numpy()
-             for p in sorted(hint_dir.glob("*.png"))]
+    hints = [video_io.preprocess_hint_frame(video_io.imread_unchanged(p), meta)[0].float().numpy()
+             for p in sorted(hint_dir.iterdir())]
     np.stack(hints).astype(np.float32).tofile(out / "hints.f32")
     return str(first), str(hint_dir)
 
@@ -120,7 +135,8 @@ class Collector:
 def main() -> None:
     out = Path(sys.argv[1])
     exr_linear = "--exr-linear" in sys.argv[2:]
-    with_hints = "--hints" in sys.argv[2:]
+    hints_exr = "--hints-exr" in sys.argv[2:]
+    with_hints = "--hints" in sys.argv[2:] or hints_exr
     frames_dir = out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     portrait = cv2.imread(str(ROOT / "data" / "green_screen_portrait.png"), cv2.IMREAD_COLOR)
@@ -149,7 +165,7 @@ def main() -> None:
     )
     initial_hint_path = hint_video_path = None
     if with_hints:
-        initial_hint_path, hint_video_path = write_hints(out, frames_bgr)
+        initial_hint_path, hint_video_path = write_hints(out, frames_bgr, exr=hints_exr)
     runtime.run_inference(model, str(frames_dir), str(out / "unused"), cfg, WriterConfig(),
                           initial_hint_path=initial_hint_path, hint_video_path=hint_video_path)
 

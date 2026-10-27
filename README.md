@@ -49,19 +49,76 @@ After that everything loads from those local folders.
 ## Command Line (`corridorkey`)
 
 A Rust command line covers setup and runs, with typed, checked options
-(`cargo install --path crates/corridorkey-cli`, or `cargo run -p corridorkey-cli --`):
+(`cargo install --path crates/corridorkey-cli`, or `cargo run --release -p corridorkey-cli --`):
 
 ```
 corridorkey doctor                      # GPU runtimes, assets, Python environment
 corridorkey weights download            # verified downloads (SHA-256 / MD5), skips files present
 corridorkey weights check [--hash]      # assets present, checkpoint header, optional checksums
 corridorkey infer -i clip.mp4 -o out --outputs alpha,fg,checker
+corridorkey bench --size 1920x1080 --frames 8   # speed and peak GPU memory of the Rust engine
 corridorkey interactive [clip.mp4]
 ```
 
 Options use dashes (`--hann-chunk`, `--low-vram`); `corridorkey infer --help` lists
-them all. Inference still runs on the Python runtime (through `uv run`) until the
-Burn/CubeCL pipeline replaces it.
+them all. `infer` runs the Rust engine below by default; `--engine python` runs
+`infer.py` instead.
+
+## Rust Engine (`corridorkey-rs`)
+
+The whole keying pipeline also runs in Rust, on [CubeCL](https://github.com/tracel-ai/cubecl)
+and [Burn](https://github.com/tracel-ai/burn): the three foundation models, Stage 1 and
+Stage 2, Hann blending, hints and output rendering, with every frame kept on the GPU
+from decoding to the finished outputs. It writes the same files as `infer.py`, matching
+its fp32 output to about 1e-6, and on an 8 GB laptop GPU it is faster than PyTorch's
+fastest mode and needs about half its memory (see the pull request benchmark).
+
+One build covers NVIDIA (CUDA) and any GPU with Vulkan, Metal or DirectX 12 (WGPU);
+pick one per run with `--runtime cuda|wgpu` or `CORRIDORKEY_RUNTIME`. Precision is f16
+on GPUs that support it (`--precision auto|f16|f32`).
+
+Before the first run, convert the foundation weights once:
+
+```
+uv run python scripts/convert_foundations.py
+cargo build --release -p corridorkey-cli
+./target/release/corridorkey infer -i clip.mp4 -o out --outputs alpha,fg
+```
+
+Everything `infer.py` takes works the same way: video or PNG/JPEG/EXR frame folders,
+`--frame-dir-linear`, first-frame hints and hint videos, every start mode, every output,
+video or EXR. `--model-scale` other than 1 is refused, as by `infer.py`. Without
+`--hann-chunk`, the window size is chosen from free GPU memory, and a window that would
+not fit is refused before the run starts.
+
+From Python, the same engine is the `corridorkey-rs` package
+(`import corridorkey_rs`), built with [maturin](https://www.maturin.rs/):
+
+```
+cd crates/corridorkey-py
+maturin develop --release          # into the active virtual environment
+```
+
+```python
+import corridorkey_rs as ck
+
+keyer = ck.Keyer(root=".", runtime="cuda")            # loads the networks once
+keyer.key_clip("clip.mp4", "out", outputs=["alpha", "fg"])
+mattes = keyer.key_frames(frames)                       # uint8 (T, H, W, 3) -> {"alpha": float32 (T, H, W), ...}
+```
+
+Keying releases the GIL, so other Python threads keep running.
+
+Measured on an RTX 2070 Max-Q laptop GPU (8 GB, Turing), whole pipeline, one 8-frame
+window; newer and larger GPUs should do better for both engines:
+
+![Throughput by frame size](docs/benchmarks/throughput.png)
+![Peak GPU memory by frame size](docs/benchmarks/memory.png)
+![Alpha accuracy against PyTorch fp32](docs/benchmarks/accuracy.png)
+
+Compiled kernels and tuning results are cached in `~/.cache/cubecl`, so only the
+first run on a machine pays for compiling and tuning. `CORRIDORKEY_CACHE_DIR` moves the
+cache, and `CORRIDORKEY_KERNEL_CACHE=0` turns kernel caching off.
 
 ## Drag-And-Drop Launcher
 

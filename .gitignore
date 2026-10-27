@@ -40,6 +40,10 @@ path_mappings.json
 .knowledge/
 data/
 benchmarks/results/
+# Committed: the benchmark charts and their data, and the memory model's measurements
+!docs/benchmarks/*.png
+!docs/benchmarks/data/
+!crates/corridorkey-io/data/
 
 # Rust
 target/

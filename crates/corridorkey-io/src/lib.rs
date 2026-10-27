@@ -8,6 +8,7 @@ pub mod hints;
 pub mod images;
 pub mod memory;
 pub mod numpy_rng;
+pub mod resize;
 pub mod video;
 pub mod vram;
 pub mod writers;

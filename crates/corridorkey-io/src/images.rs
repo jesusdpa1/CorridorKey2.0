@@ -51,6 +51,32 @@ fn read_exr_rgb(path: &Path) -> Result<((usize, usize), Vec<f32>)> {
     Ok(((size.height(), size.width()), image.layer_data.channel_data.pixels.0))
 }
 
+/// An EXR file as `cv2.imread(IMREAD_UNCHANGED)` (the product's `exr_io.read_exr`) lays it out:
+/// `((h, w), channels, values)`, values interleaved in B G R (A) order for a color image
+/// (channels 3 or 4), one channel for a `Y` or single-channel image.
+pub fn read_exr_cv(path: &Path) -> Result<((usize, usize), usize, Vec<f32>)> {
+    let image = exr::prelude::read_first_flat_layer_from_file(path).with_context(|| format!("reading {}", path.display()))?;
+    let layer = image.layer_data;
+    let (w, h) = (layer.size.width(), layer.size.height());
+    let planes: Vec<(String, Vec<f32>)> =
+        layer.channel_data.list.iter().map(|c| (c.name.to_string(), c.sample_data.values_as_f32().collect())).collect();
+    let plane = |name: &str| planes.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice());
+    let interleave = |order: &[&[f32]]| -> Vec<f32> { (0..w * h).flat_map(|i| order.iter().map(move |p| p[i])).collect() };
+    if let (Some(b), Some(g), Some(r)) = (plane("B"), plane("G"), plane("R")) {
+        return Ok(match plane("A") {
+            Some(a) => ((h, w), 4, interleave(&[b, g, r, a])),
+            None => ((h, w), 3, interleave(&[b, g, r])),
+        });
+    }
+    if let Some(y) = plane("Y") {
+        return Ok(((h, w), 1, y.to_vec()));
+    }
+    match planes.as_slice() {
+        [(_, only)] => Ok(((h, w), 1, only.clone())),
+        _ => bail!("{}: no RGB, Y or single channel to read (channels: {:?})", path.display(), planes.iter().map(|(n, _)| n).collect::<Vec<_>>()),
+    }
+}
+
 /// Size `(h, w)` of a frame file.
 fn frame_hw(path: &Path) -> Result<(usize, usize)> {
     if is_exr(path) {
