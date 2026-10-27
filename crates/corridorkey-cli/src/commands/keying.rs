@@ -13,16 +13,11 @@ use corridorkey_ml::pipeline::ModelPaths;
 
 use super::infer::{ExrDtype, InferArgs, Output, OutputFormat, Precision, StartMode};
 
+/// Options neither engine supports. The product refuses a model scale other than 1 too
+/// ("optimized runtime render path requires native model_scale=1.0").
 fn unsupported(args: &InferArgs) -> Result<()> {
-    let mut not_yet = vec![];
-    if args.memory.low_vram {
-        not_yet.push("--low-vram");
-    }
     if args.frames.model_scale != 1.0 {
-        not_yet.push("--model-scale other than 1 (the product's render path also needs 1)");
-    }
-    if !not_yet.is_empty() {
-        bail!("not supported by the Rust engine yet: {} (use --engine python)", not_yet.join(", "));
+        bail!("--model-scale other than 1 is not supported (the PyTorch product's render path refuses it too)");
     }
     Ok(())
 }
@@ -57,6 +52,8 @@ fn clip_options(args: &InferArgs) -> ClipOptions {
         carry_hint: !h.no_carry_hint,
         carry_hint_quality: h.carry_hint_quality,
         stage2_batch: args.memory.stage2_batch,
+        low_vram: args.memory.low_vram,
+        low_vram_foundation_chunk: args.memory.low_vram_foundation_chunk,
         exr: (e.output_format == OutputFormat::Exr).then_some(e.exr_dtype == ExrDtype::Half),
         despill: c.despill_strength,
         cutout_linear: c.cutout_linear,

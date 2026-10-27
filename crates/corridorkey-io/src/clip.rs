@@ -70,6 +70,10 @@ pub struct ClipOptions {
     pub carry_hint: bool,
     pub carry_hint_quality: f64,
     pub stage2_batch: usize,
+    /// Staged low-memory inference (`--low-vram`): backbones run `low_vram_foundation_chunk`
+    /// frames at a time; same result, lower peak memory.
+    pub low_vram: bool,
+    pub low_vram_foundation_chunk: usize,
     /// EXR sequences instead of videos: `Some(true)` half, `Some(false)` float.
     pub exr: Option<bool>,
     pub despill: f64,
@@ -98,6 +102,8 @@ impl ClipOptions {
             carry_hint: true,
             carry_hint_quality: 0.95,
             stage2_batch: 1,
+            low_vram: false,
+            low_vram_foundation_chunk: 4,
             exr: None,
             despill: 0.5,
             cutout_linear: false,
@@ -121,6 +127,7 @@ impl ClipOptions {
             despill: self.despill,
             cutout_linear: self.cutout_linear,
             product_rounding: true,
+            foundation_chunk: self.low_vram.then_some(self.low_vram_foundation_chunk.max(1)),
         }
     }
 }
@@ -455,7 +462,7 @@ fn write_settings(path: &Path, opts: &ClipOptions, meta: &FrameMeta, cfg: &Pipel
         "CorridorKey v2 Inference Settings Log\n====================================\n\
          Input: {}\nOutput Directory: {}\nResolution: {w0}x{h0}\nFPS: {}\nOutputs: {}\nOutput Format: {}\n\
          Hint First Frame: {}\nHint Video: {}\nHint Quality (Trust): {}\nCarry Hint: {}\nCarry Hint Quality: {}\n\
-         Despill Strength: {}\nCutout Linear: {}\nFrame Dir Linear: {}\nHann Chunk: {}\nHann Stride: {}\nLow VRAM: false\n\
+         Despill Strength: {}\nCutout Linear: {}\nFrame Dir Linear: {}\nHann Chunk: {}\nHann Stride: {}\nLow VRAM: {}\n\
          Model Scale: 1\nNum Frames: {}\nStart Mode: {start_mode}\nSeed: {}\nLinear Brightness: {}\nLinear Contrast: {}\n\
          Linear Contrast Pivot: {}\nEngine: rust\n",
         opts.input.display(),
@@ -473,6 +480,7 @@ fn write_settings(path: &Path, opts: &ClipOptions, meta: &FrameMeta, cfg: &Pipel
         opts.frame_dir_linear,
         cfg.chunk,
         cfg.stride,
+        opts.low_vram,
         meta.num_frames,
         opts.seed,
         l.gain,

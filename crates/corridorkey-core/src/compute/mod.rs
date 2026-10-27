@@ -19,7 +19,7 @@ mod target;
 pub mod tune;
 
 pub use crate::device::{ComputeError, ComputeTarget, RUNTIME_ENV};
-pub use target::{open_device, shutdown_devices};
+pub use target::{CACHE_DIR_ENV, KERNEL_CACHE_ENV, configure_runtime, open_device, shutdown_devices};
 #[cfg(not(target_arch = "wasm32"))]
 pub use target::exit_now;
 pub use limits::{device_elements, MAX_DEVICE_ELEMENTS};

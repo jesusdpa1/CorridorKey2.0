@@ -150,6 +150,10 @@ pub struct PipelineConfig {
     /// Reproduce the product's host-side roundings: blended batons to f16 before Stage 2, carried
     /// hints and hint qualities to bf16.
     pub product_rounding: bool,
+    /// Frames per backbone pass (C-RADIO, MoGe) within a window; `None` runs the whole window at
+    /// once. The backbones see each frame on its own, so the result is the same, with only this
+    /// many frames' backbone activations held at once (the product's `low_vram_foundation_chunk`).
+    pub foundation_chunk: Option<usize>,
 }
 
 impl Default for PipelineConfig {
@@ -165,6 +169,7 @@ impl Default for PipelineConfig {
             despill: 0.5,
             cutout_linear: false,
             product_rounding: true,
+            foundation_chunk: None,
         }
     }
 }
@@ -259,9 +264,18 @@ impl Keyer {
             let tc = t1 - t0;
             let views = upload_frame_views::<F>(client, &reader.read(t0, tc)?, tc, meta, adjust)?;
             let inputs = BackboneInputs::from_views::<F>(client, &views);
-            let cradio = self.cradio.forward::<F>(ctx, ctx.tensor_from_handle(inputs.cradio, [tc, h4, w4, 3], dt))?;
             let (mh, mw) = inputs.moge_hw;
-            let moge = self.moge.forward::<F>(ctx, ctx.tensor_from_handle(inputs.moge, [tc, mh, mw, 3], dt))?;
+            let cradio_in = ctx.tensor_from_handle::<4>(inputs.cradio, [tc, h4, w4, 3], dt);
+            let moge_in = ctx.tensor_from_handle::<4>(inputs.moge, [tc, mh, mw, 3], dt);
+            let fc = cfg.foundation_chunk.unwrap_or(tc).clamp(1, tc);
+            let (mut cradio_parts, mut moge_parts) = (Vec::new(), Vec::new());
+            for s in (0..tc).step_by(fc) {
+                let n = fc.min(tc - s);
+                cradio_parts.push(self.cradio.forward::<F>(ctx, cradio_in.clone().narrow(0, s, n))?);
+                moge_parts.push(self.moge.forward::<F>(ctx, moge_in.clone().narrow(0, s, n))?);
+            }
+            let cradio = Tensor::cat(cradio_parts, 0);
+            let moge = Tensor::cat(moge_parts, 0);
             let rvm_w = empty::<F>(client, tc * p64 * rvm_dim);
             copy::<F>(client, &rvm_all, &rvm_w, tc * p64 * rvm_dim, t0 * p64 * rvm_dim, 0);
             let rvm = ctx.tensor_from_handle::<4>(rvm_w, [tc, h64, w64, rvm_dim], dt);

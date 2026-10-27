@@ -149,7 +149,7 @@ impl Keyer {
     #[pyo3(signature = (
         input, output_dir, *, outputs = vec!["alpha".to_string(), "fg".to_string()], num_frames = None,
         start_mode = "begin", seed = 0, frame_dir_fps = 24.0, frame_dir_linear = false, hann_chunk = None, hann_stride = None,
-        hint_first_frame = None, hint_video = None, hint_quality = 0.95, carry_hint = true, carry_hint_quality = 0.95, stage2_batch = 1,
+        hint_first_frame = None, hint_video = None, hint_quality = 0.95, carry_hint = true, carry_hint_quality = 0.95, stage2_batch = 1, low_vram = false,
         output_format = "video", exr_dtype = "half", despill_strength = 0.5, cutout_linear = false,
         linear_brightness = 1.0, linear_contrast = 1.0, linear_contrast_pivot = 0.18,
         ffmpeg = "ffmpeg".to_string(), ffmpeg_codec = "libx264".to_string(), crf = 12,
@@ -176,6 +176,7 @@ impl Keyer {
         carry_hint: bool,
         carry_hint_quality: f64,
         stage2_batch: usize,
+        low_vram: bool,
         output_format: &str,
         exr_dtype: &str,
         despill_strength: f64,
@@ -219,6 +220,7 @@ impl Keyer {
             carry_hint,
             carry_hint_quality,
             stage2_batch,
+            low_vram,
             exr,
             despill: despill_strength,
             cutout_linear,
@@ -254,7 +256,7 @@ impl Keyer {
     #[pyo3(signature = (
         frames, *, outputs = vec!["alpha".to_string(), "fg".to_string()], hann_chunk = None,
         hann_stride = None, hint_first_frame = None, hints = None, hint_quality = 0.95, carry_hint = true, carry_hint_quality = 0.95,
-        stage2_batch = 1, despill_strength = 0.5, cutout_linear = false, linear_brightness = 1.0,
+        stage2_batch = 1, low_vram = false, despill_strength = 0.5, cutout_linear = false, linear_brightness = 1.0,
         linear_contrast = 1.0, linear_contrast_pivot = 0.18
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -271,6 +273,7 @@ impl Keyer {
         carry_hint: bool,
         carry_hint_quality: f64,
         stage2_batch: usize,
+        low_vram: bool,
         despill_strength: f64,
         cutout_linear: bool,
         linear_brightness: f64,
@@ -291,6 +294,7 @@ impl Keyer {
             carry_hint,
             carry_hint_quality,
             stage2_batch,
+            low_vram,
             despill: despill_strength,
             cutout_linear,
             linear: LinearAdjust { gain: linear_brightness, contrast: linear_contrast, pivot: linear_contrast_pivot },

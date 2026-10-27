@@ -30,9 +30,44 @@ pub trait ComputeTask {
     fn run(self, client: Client) -> Self::Output;
 }
 
+/// Turns off CubeCL's on-disk cache of compiled kernels when set to `0` (on by default).
+pub const KERNEL_CACHE_ENV: &str = "CORRIDORKEY_KERNEL_CACHE";
+/// Directory of CubeCL's caches (compiled kernels, autotune results) instead of the user cache.
+pub const CACHE_DIR_ENV: &str = "CORRIDORKEY_CACHE_DIR";
+
+/// CubeCL's configuration, set once before the first device opens: what CubeCL itself would load
+/// (`cubecl.toml` / `burn.toml` up from the working directory, `CUBECL_*` variables), with the
+/// compiled-kernel cache on. CubeCL keeps it off by default, so every process compiled every
+/// kernel again: 8–16 s before the first frame on the RTX 2070 even with autotune results cached.
+/// Kernels are cached per device and driver in CubeCL's environment, next to the autotune results.
+/// That environment moves from CubeCL's default (a Cargo project's `target/`, found from the
+/// working directory, so an installed command or a Python script started elsewhere began cold
+/// every time) to the user cache (`~/.cache/cubecl`), or to [`CACHE_DIR_ENV`]; a `cubecl.toml`
+/// that names a place keeps it. [`KERNEL_CACHE_ENV`]`=0` leaves kernel caching off. An
+/// application that set CubeCL's configuration first keeps its own (`try_set`).
+pub fn configure_runtime() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
+            config.compilation.cache = std::env::var(KERNEL_CACHE_ENV).map_or(true, |v| v.trim() != "0");
+            use cubecl::config::cache::CacheConfig;
+            match std::env::var_os(CACHE_DIR_ENV) {
+                Some(dir) if !dir.is_empty() => config.environment.path = CacheConfig::Directory(dir.into()),
+                _ if matches!(config.environment.path, CacheConfig::Target) => config.environment.path = CacheConfig::Global,
+                _ => {}
+            }
+            let _ = CubeClRuntimeConfig::try_set(config);
+        });
+    }
+}
+
 impl ComputeTarget {
     /// The default device of this runtime, if it is compiled in.
     pub fn device(self) -> Result<Device, ComputeError> {
+        configure_runtime();
         Ok(match self.checked()? {
             Self::Wgpu => Device::Wgpu(WgpuDevice::default()),
             Self::Cpu => Device::Cpu(CpuDevice),
@@ -159,6 +194,7 @@ fn opened(device: &Device) {
 /// The client of `device`, recorded so that [`shutdown_devices`] shuts it down at exit. Use this
 /// instead of `Device::client` wherever a specific device is opened (e.g. one GPU of several).
 pub fn open_device(device: Device) -> Client {
+    configure_runtime();
     let client = device.client();
     opened(&device);
     client

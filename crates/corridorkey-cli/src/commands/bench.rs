@@ -39,6 +39,9 @@ pub struct BenchArgs {
     /// Timed runs after the first (the first is reported apart: it includes one-time setup)
     #[arg(long, default_value_t = 3)]
     pub runs: usize,
+    /// Backbones a few frames at a time (`infer --low-vram`)
+    #[arg(long)]
+    pub low_vram: bool,
     /// Append the result as one JSON line to this file
     #[arg(long)]
     pub json: Option<PathBuf>,
@@ -98,6 +101,7 @@ fn bench_once(root: &Path, target: ComputeTarget, args: &BenchArgs) -> Result<se
         outputs: vec![RenderOutput::Alpha, RenderOutput::Fg],
         hann_chunk: Some(chunk),
         hann_stride: Some((chunk / 2).max(1)),
+        low_vram: args.low_vram,
         ..ClipOptions::new("", "")
     };
     let mut times = vec![];
@@ -118,7 +122,7 @@ fn bench_once(root: &Path, target: ComputeTarget, args: &BenchArgs) -> Result<se
         "precision": match keyer.precision() { corridorkey_io::Precision::F16 => "f16", _ => "f32" },
         "width": w, "height": h, "padded_width": pw, "padded_height": ph,
         "megapixels": (pw * ph) as f64 / 1e6,
-        "frames": args.frames, "chunk": chunk, "stride": (chunk / 2).max(1),
+        "frames": args.frames, "chunk": chunk, "stride": (chunk / 2).max(1), "low_vram": args.low_vram,
         "load_s": load_s,
         "first_run_s": times[0],
         "runs_s": steady,
@@ -138,11 +142,15 @@ fn append_json(path: &Path, value: &serde_json::Value) -> Result<()> {
 }
 
 /// One child process of the sweep; `Ok(false)` when it failed (e.g. out of memory).
-fn run_child(root: &Path, target: ComputeTarget, size: &str, chunk: usize, precision: &str, runs: usize, json: Option<&Path>) -> Result<bool> {
+#[allow(clippy::too_many_arguments)]
+fn run_child(root: &Path, target: ComputeTarget, size: &str, chunk: usize, precision: &str, runs: usize, low_vram: bool, json: Option<&Path>) -> Result<bool> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["--root", &root.display().to_string(), "--runtime", target.name(), "bench"])
         .args(["--size", size, "--frames", &chunk.to_string(), "--chunk", &chunk.to_string()])
         .args(["--precision", precision, "--runs", &runs.to_string()]);
+    if low_vram {
+        cmd.arg("--low-vram");
+    }
     if let Some(j) = json {
         cmd.arg("--json").arg(j);
     }
@@ -167,10 +175,10 @@ fn sweep(root: &Path, target: ComputeTarget, args: &BenchArgs) -> Result<()> {
             for &chunk in &args.sweep_chunks {
                 println!("  {} {precision} {size} window {chunk}", target.name());
                 // Warm-up: tunes and caches every shape of this configuration
-                if !run_child(root, target, size, chunk, precision, 0, None)? {
+                if !run_child(root, target, size, chunk, precision, 0, args.low_vram, None)? {
                     break; // larger windows of this size will not fit either
                 }
-                if !run_child(root, target, size, chunk, precision, args.runs, Some(json))? {
+                if !run_child(root, target, size, chunk, precision, args.runs, args.low_vram, Some(json))? {
                     break;
                 }
             }
