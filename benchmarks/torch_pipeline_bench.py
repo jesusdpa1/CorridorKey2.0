@@ -42,6 +42,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from corridorkey import color_utils as cu  # noqa: E402
 from corridorkey import runtime, video_io  # noqa: E402
 from corridorkey.runtime import InferenceConfig, RuntimePaths, load_model  # noqa: E402
 from corridorkey.video_io import WriterConfig  # noqa: E402
@@ -80,9 +81,12 @@ class PeakSampler:
 
 
 class Collector:
-    """Stands in for the product's writers: keeps the frames handed to it."""
+    """Stands in for the product's writers: counts the frames handed to it, and keeps the alpha
+    frames when `keep_alpha`."""
 
     frames: dict[str, int] = {}
+    keep_alpha = False
+    alpha: list[np.ndarray] = []
 
     def __init__(self, *args, frame_name: str = "frame", **kwargs):
         self.name = frame_name
@@ -90,7 +94,9 @@ class Collector:
 
     def write_many(self, frames):
         for f in frames:
-            np.asarray(f)
+            a = np.asarray(f)
+            if Collector.keep_alpha and self.name == "alpha":
+                Collector.alpha.append(np.array(a, dtype=np.float32).reshape(a.shape[:2]))
             Collector.frames[self.name] += 1
 
     def write(self, frame):
@@ -98,6 +104,26 @@ class Collector:
 
     def release(self):
         pass
+
+
+def preprocess_frame_dir_path_f32(path: str, meta: dict, *, need_model: bool):
+    """`video_io.preprocess_frame_dir_path` keeping its views in float32 (it rounds them to bf16,
+    which an fp32 model without autocast cannot take); as `scripts/parity/pipeline_reference.py`."""
+    h_out, w_out = meta["shape_hw"]
+    h_model, w_model = meta["model_native_hw"]
+    display, linear = video_io._read_frame_dir_views(path, exr_linear=bool(meta.get("exr_linear", False)))
+    display = video_io.resize_hwc_lanczos(display, (h_model, w_model))
+    linear = video_io.resize_hwc_lanczos(linear, (h_model, w_model))
+    display, _ = video_io.center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
+    display_t = torch.from_numpy(display.transpose(2, 0, 1).copy()).float()
+    if not need_model:
+        return None, display_t, display_t
+    linear, _ = video_io.center_pad_to_shape(linear, h_out, w_out)
+    model_t = torch.from_numpy(cu.linear_to_asinh(linear).transpose(2, 0, 1).copy()).float()
+    return model_t, display_t, display_t
+
+
+PREPROCESS = video_io.preprocess_frame_dir_path
 
 
 def fastest_dtype() -> torch.dtype:
@@ -108,6 +134,7 @@ def fastest_dtype() -> torch.dtype:
 def patch_autocast(mode: str) -> None:
     original = getattr(patch_autocast, "original", torch.autocast)
     patch_autocast.original = original
+    video_io.preprocess_frame_dir_path = preprocess_frame_dir_path_f32 if mode == "fp32" else PREPROCESS
     if mode == "fp32":
         torch.autocast = lambda *a, **k: contextlib.nullcontext()
     elif mode == "fastest":
@@ -141,6 +168,8 @@ def main() -> None:
     ap.add_argument("--modes", default="fp32,bf16,fastest")
     ap.add_argument("--runs", type=int, default=2)
     ap.add_argument("--json", required=True)
+    ap.add_argument("--dump-alpha", help="directory for each mode's alpha of the last run, `<mode>.f32` [T, h, w]")
+    ap.add_argument("--dump-frames", help="file for the clip's frames, raw RGB uint8 [T, h, w, 3]")
     args = ap.parse_args()
     w, h = (int(v) for v in args.size.split("x"))
 
@@ -151,6 +180,9 @@ def main() -> None:
     frame_dir = work / "frames"
     frame_dir.mkdir()
     make_clip((w, h), args.frames, frame_dir)
+    if args.dump_frames:
+        rgb = [cv2.imread(str(p), cv2.IMREAD_COLOR)[..., ::-1] for p in sorted(frame_dir.glob("*.png"))]
+        np.stack(rgb).tofile(args.dump_frames)
 
     # Frames decoded once, before timing; the product's preprocessing of them stays timed.
     read_views = video_io._read_frame_dir_views
@@ -178,6 +210,8 @@ def main() -> None:
             torch.cuda.empty_cache()
             sampler.reset()
             for i in range(args.runs + 1):
+                Collector.keep_alpha = bool(args.dump_alpha) and i == args.runs
+                Collector.alpha = []
                 torch.cuda.synchronize()
                 t = time.perf_counter()
                 with contextlib.redirect_stdout(open(os.devnull, "w")):
@@ -185,6 +219,9 @@ def main() -> None:
                                           initial_hint_path=None, hint_video_path=None)
                 torch.cuda.synchronize()
                 times.append(time.perf_counter() - t)
+            if args.dump_alpha:
+                Path(args.dump_alpha).mkdir(parents=True, exist_ok=True)
+                np.stack(Collector.alpha).astype(np.float32).tofile(Path(args.dump_alpha) / f"{mode}.f32")
             steady = times[1:]
             result |= {"first_run_s": times[0], "runs_s": steady, "best_s": min(steady),
                        "mean_s": sum(steady) / len(steady), "fps": args.frames / min(steady),
