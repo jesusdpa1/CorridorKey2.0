@@ -18,6 +18,7 @@ dependencies = [
     "pillow>=13.0.0",
     "tqdm>=4.70.1",
     "utils3d",
+    "openexr>=3.5.2",
 ]
 
 [tool.uv]

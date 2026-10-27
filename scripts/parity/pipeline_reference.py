@@ -17,7 +17,7 @@ blend, carried hints and hint quality to bf16.
 Writes `frames/NNNN.png`, `frames_rgb8.u8` (the same frames, raw RGB), `<output>.f32` (`[T, h, w, C]` as written: BGR / BGRA / alpha) and
 `meta.json`.
 
-With `--exr-linear` (needs `uv run --with OpenEXR`): the frames are scene-linear EXR (the portrait's linear values × 1.6, so
+With `--exr-linear`: the frames are scene-linear EXR (the portrait's linear values × 1.6, so
 highlights go above 1) keyed with `frame_dir_linear`, writing `frames/NNNN.exr` and
 `frames_rgbf32.f32` (`[T, h, w, 3]` float RGB) instead of the PNG and byte files.
 
@@ -37,19 +37,15 @@ import json
 import sys
 from pathlib import Path
 
-import os
-
-os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-
-import cv2  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+import cv2
+import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from corridorkey import color_utils as cu  # noqa: E402
-from corridorkey import runtime, video_io  # noqa: E402
+from corridorkey import exr_io, runtime, video_io  # noqa: E402
 from corridorkey.runtime import InferenceConfig, RuntimePaths, load_model  # noqa: E402
 from corridorkey.video_io import WriterConfig  # noqa: E402
 
@@ -102,15 +98,6 @@ def write_hints(out: Path, frames_bgr: list[np.ndarray]) -> tuple[str, str]:
     return str(first), str(hint_dir)
 
 
-def read_exr_rgb(path) -> np.ndarray:
-    """`video_io.read_image_rgb` for EXR through the OpenEXR package: the float RGB values
-    `cv2.imread(IMREAD_UNCHANGED)` + BGR→RGB returns where OpenCV has its EXR codec."""
-    import OpenEXR
-
-    with OpenEXR.File(str(path)) as f:
-        return np.asarray(f.channels()["RGB"].pixels, dtype=np.float32)
-
-
 class Collector:
     """Stands in for `ExrSequenceWriter`: keeps every frame handed to it."""
 
@@ -140,14 +127,8 @@ def main() -> None:
     frames_bgr = [np.roll(portrait, 6 * i, axis=1) for i in range(FRAMES)]
     if exr_linear:
         frames_lin = [(cu.srgb_to_linear(f.astype(np.float32) / 255.0) * 1.6).astype(np.float32) for f in frames_bgr]
-        import OpenEXR  # this OpenCV build has no EXR codec (`OpenEXR: NO`)
-
         for i, frame in enumerate(frames_lin):
-            rgb = np.ascontiguousarray(frame[..., ::-1])
-            header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
-            with OpenEXR.File(header, {"RGB": rgb}) as f:
-                f.write(str(frames_dir / f"{i:04d}.exr"))
-        video_io.read_image_rgb = read_exr_rgb
+            exr_io.write_exr(frames_dir / f"{i:04d}.exr", frame, half=False)
         np.stack([f[..., ::-1] for f in frames_lin]).astype(np.float32).tofile(out / "frames_rgbf32.f32")
     else:
         for i, frame in enumerate(frames_bgr):
