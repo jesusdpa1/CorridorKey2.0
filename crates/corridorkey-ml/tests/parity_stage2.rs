@@ -104,7 +104,7 @@ fn compare_stage2_with_python() {
             });
             let (qkv_4d, bias_done) = b0.attn.core.project_qkv_spatial::<f32>(&ctx, u1.clone()).unwrap();
             let c_qkv = corridorkey_ml::into_contiguous_cube(qkv_4d).unwrap();
-            let (cos_h, sin_h) = b0.attn.rope.cos_sin_handles::<f32>(ctx.client(), h16, w16);
+            let (cos_h, sin_h) = b0.attn.rope.cos_sin_handles::<f32>(&ctx, h16, w16);
             let (q, k, v) = b0.attn.core.prep_qkv_norm_rope::<f32>(
                 &ctx,
                 c_qkv.handle,

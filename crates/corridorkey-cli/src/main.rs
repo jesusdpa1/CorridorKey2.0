@@ -2,7 +2,6 @@
 //! module with its own arguments; this file only parses and dispatches.
 
 mod commands;
-mod io;
 mod progress;
 
 use std::path::PathBuf;
@@ -41,6 +40,8 @@ enum Command {
     Weights(commands::weights::WeightsArgs),
     /// Key a clip (video file or frame directory) and write alpha / foreground / previews
     Infer(commands::infer::InferArgs),
+    /// Time the Rust engine and read its peak GPU memory (one configuration, or a sweep)
+    Bench(commands::bench::BenchArgs),
     /// Guided run: asks for the clip and options in the terminal
     Interactive(commands::interactive::InteractiveArgs),
 }
@@ -66,11 +67,23 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Doctor => commands::doctor::run(&root, cli.target().ok()),
         Command::Weights(args) => commands::weights::run(&root, args),
-        Command::Infer(args) => {
-            commands::infer::run(&root, cli.target(), args)?;
-            // Writers are flushed and closed: exit now rather than tearing the GPU runtimes down
-            // (driver threads can race process teardown; dsp-kitchen lessons §7).
-            std::process::exit(0)
+        Command::Infer(_) | Command::Bench(_) => {
+            // Work is done and outputs closed either way: end the process now rather than tearing
+            // the GPU runtimes down (driver threads race process teardown, dsp-kitchen lessons §7;
+            // autotuners keep clients alive, so a device shutdown would wait out its timeout).
+            let result = match &cli.command {
+                Command::Infer(args) => commands::infer::run(&root, cli.target(), args),
+                Command::Bench(args) => cli.target().and_then(|t| commands::bench::run(&root, t, args)),
+                _ => unreachable!(),
+            };
+            let code = match result {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    1
+                }
+            };
+            corridorkey_core::compute::exit_now(code)
         }
         Command::Interactive(args) => commands::interactive::run(&root, args),
     }

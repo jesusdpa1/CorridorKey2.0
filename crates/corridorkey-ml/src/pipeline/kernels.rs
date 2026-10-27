@@ -4,6 +4,7 @@
 use cubecl::prelude::*;
 
 use corridorkey_base::core::CkFloat;
+use corridorkey_base::frame::kernels::prep::reflect_101;
 
 /// `bf16(x)` as f32: round to nearest even on the upper 16 bits (the product stores carried hints
 /// and hint qualities as bf16 tensors).
@@ -71,6 +72,39 @@ pub fn carry_hint_kernel<F: CkFloat>(aux: &[F], out: &mut [F], len: u32, frame: 
             out[i as usize] = F::cast_from(round_bf16(v));
         } else {
             out[i as usize] = F::cast_from(v);
+        }
+    }
+}
+
+/// Hints `[count, H, W]` from native-size hints `[count, h0, w0]` (values in [0, 1]), reflect-101
+/// padded like the frames (`center_pad_to_shape`), written at `dst[dst_offset ..]`; rounded through
+/// bf16 when `round_bf16_hint` (the product's hint tensor is bf16).
+#[cube(launch)]
+pub fn pad_hint_kernel<F: CkFloat>(
+    src: &[f32],
+    dst: &mut [F],
+    total: u32,
+    h: u32,
+    w: u32,
+    h0: u32,
+    w0: u32,
+    top: u32,
+    left: u32,
+    dst_offset: u32,
+    #[comptime] round_bf16_hint: bool,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < total {
+        let x = i % w;
+        let y = (i / w) % h;
+        let t = i / (w * h);
+        let sy = reflect_101(y, top, h0);
+        let sx = reflect_101(x, left, w0);
+        let v = src[((t * h0 + sy) * w0 + sx) as usize];
+        if comptime!(round_bf16_hint) {
+            dst[(dst_offset + i) as usize] = F::cast_from(round_bf16(v));
+        } else {
+            dst[(dst_offset + i) as usize] = F::cast_from(v);
         }
     }
 }

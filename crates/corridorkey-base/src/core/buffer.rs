@@ -79,6 +79,16 @@ pub fn download<E: CubeElement>(client: &Client, handle: Handle) -> Vec<E> {
     E::from_bytes(&client.read_one_unchecked(handle)).to_vec()
 }
 
+/// [`download`] that fails when the device reports an error in the work leading to the read. CubeCL
+/// logs a failed allocation or launch as a warning and skips that work, so outputs read without this
+/// check can be silently wrong (e.g. a window too large for the device memory).
+pub fn try_download<E: CubeElement>(client: &Client, handle: Handle) -> corridorkey_core::CkResult<Vec<E>> {
+    let bytes = client
+        .read_one(handle)
+        .map_err(|e| corridorkey_core::CkError::ComputeError(format!("device work failed (out of device memory?): {e:?}")))?;
+    Ok(E::from_bytes(&bytes).to_vec())
+}
+
 /// Host copy of the first `len` elements of `E` of a device buffer: only those bytes are read, so a
 /// buffer sized for the largest batch costs only the current batch's transfer.
 pub fn download_prefix<E: CubeElement>(client: &Client, handle: Handle, len: usize) -> Vec<E> {

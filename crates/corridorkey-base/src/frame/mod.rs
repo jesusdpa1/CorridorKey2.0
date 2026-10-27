@@ -18,8 +18,8 @@ use crate::color::asinh_params;
 use crate::core::buffer::{empty, upload};
 use crate::core::{CkFloat, cast};
 use kernels::{
-    OUT_ALPHA, OUT_CHECKER, OUT_CUTOUT, OUT_FG, area_resize_kernel, bilinear_resize_kernel, frame_views_kernel,
-    render_f32_kernel, render_u16_kernel,
+    OUT_ALPHA, OUT_CHECKER, OUT_CUTOUT, OUT_FG, area_resize_kernel, bilinear_resize_kernel, frame_views_f32_kernel,
+    frame_views_kernel, render_f32_kernel, render_u16_kernel,
 };
 
 /// Packs bytes four per little-endian `u32` word (zero-padded), the form kernels read 8-bit data in.
@@ -51,9 +51,27 @@ pub struct FrameViews {
     pub hw: (usize, usize),
 }
 
-/// [`FrameViews`] of `t` packed frames of `meta`'s native size (`model_scale` 1: the product's
-/// render path supports only that), reflect-101 padded to `meta.shape_hw`.
-pub fn frame_views<F: CkFloat>(client: &Client, frames: &Handle, t: usize, meta: &FrameMeta, adjust: LinearAdjust) -> CkResult<FrameViews> {
+/// Decoded frames as a reader hands them over: `[T, h0, w0, 3]` RGB.
+#[derive(Debug, Clone)]
+pub enum FrameData {
+    /// 8-bit display values (video, PNG / JPEG frames).
+    Rgb8(Vec<u8>),
+    /// Float values (EXR frames): scene-linear when `linear`, else display values clipped to [0, 1]
+    /// (`video_io._read_frame_dir_views`).
+    RgbF32 { values: Vec<f32>, linear: bool },
+}
+
+/// Uploads `frames` (`t` frames of `meta`'s native size) in their compact form and prepares their
+/// [`FrameViews`]: bytes through [`frame_views`], floats through [`frame_views_f32`].
+pub fn upload_frame_views<F: CkFloat>(client: &Client, frames: &FrameData, t: usize, meta: &FrameMeta, adjust: LinearAdjust) -> CkResult<FrameViews> {
+    match frames {
+        FrameData::Rgb8(bytes) => frame_views::<F>(client, &upload_frames(client, bytes), t, meta, adjust),
+        FrameData::RgbF32 { values, linear } => frame_views_f32::<F>(client, &upload(client, values), t, meta, adjust, *linear),
+    }
+}
+
+/// Checks that `meta` can be prepared on the device; returns `(h0, w0)`, `(h, w)`.
+fn check_geometry(meta: &FrameMeta) -> CkResult<((usize, usize), (usize, usize))> {
     if meta.model_native_hw != meta.native_hw {
         return Err(CkError::InvalidConfig(format!(
             "model_scale {} is not supported: frames must be prepared at their native size",
@@ -61,11 +79,55 @@ pub fn frame_views<F: CkFloat>(client: &Client, frames: &Handle, t: usize, meta:
         )));
     }
     let (h0, w0) = meta.native_hw;
-    let (h, w) = meta.shape_hw;
     let p = meta.pad;
     if p.top.max(p.bottom) >= h0 || p.left.max(p.right) >= w0 {
         return Err(CkError::InvalidConfig(format!("padding {p:?} exceeds the {h0}x{w0} frame (reflect-101)")));
     }
+    Ok(((h0, w0), meta.shape_hw))
+}
+
+/// [`FrameViews`] of `t` float frames (an f32 buffer, `[t, h0, w0, 3]`), see
+/// [`frame_views_f32_kernel`] for `linear`.
+pub fn frame_views_f32<F: CkFloat>(client: &Client, frames: &Handle, t: usize, meta: &FrameMeta, adjust: LinearAdjust, linear: bool) -> CkResult<FrameViews> {
+    let ((h0, w0), (h, w)) = check_geometry(meta)?;
+    let p = meta.pad;
+    let total = t * h * w * 3;
+    let (model, foundation) = (empty::<F>(client, total), empty::<F>(client, total));
+    let (scale, offset) = adjust.affine();
+    let (knee, denom) = asinh_params();
+    let geom = LaunchGeometry::elementwise(client, total);
+    unsafe {
+        frame_views_f32_kernel::launch::<F>(
+            client,
+            geom.cube_count,
+            geom.cube_dim,
+            1,
+            BufferArg::from_raw_parts(frames.clone(), t * h0 * w0 * 3),
+            BufferArg::from_raw_parts(model.clone(), total),
+            BufferArg::from_raw_parts(foundation.clone(), total),
+            total as u32,
+            h as u32,
+            w as u32,
+            h0 as u32,
+            w0 as u32,
+            p.top as u32,
+            p.left as u32,
+            cast::<F>(scale),
+            cast::<F>(offset),
+            cast::<F>(1.0 / knee),
+            cast::<F>(1.0 / denom),
+            linear,
+            !adjust.is_identity(),
+        );
+    }
+    Ok(FrameViews { model, foundation, t, hw: (h, w) })
+}
+
+/// [`FrameViews`] of `t` packed frames of `meta`'s native size (`model_scale` 1: the product's
+/// render path supports only that), reflect-101 padded to `meta.shape_hw`.
+pub fn frame_views<F: CkFloat>(client: &Client, frames: &Handle, t: usize, meta: &FrameMeta, adjust: LinearAdjust) -> CkResult<FrameViews> {
+    let ((h0, w0), (h, w)) = check_geometry(meta)?;
+    let p = meta.pad;
     let total = t * h * w * 3;
     let (model, foundation) = (empty::<F>(client, total), empty::<F>(client, total));
     let (scale, offset) = adjust.affine();
@@ -244,7 +306,7 @@ fn render_args(settings: &RenderSettings) -> (f32, f32, f32, f32, f32) {
 
 /// 16-bit frames `[t, h, w, channels]` (BGR / BGRA, values `floor(x · 65535)`) of `output` from
 /// `[t, H, W, 4]` logits: one download.
-pub fn render_video<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> Vec<u16> {
+pub fn render_video<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> CkResult<Vec<u16>> {
     let (h, w) = settings.padded_hw;
     let (oh, ow) = settings.native_hw;
     let channels = output.channels(false);
@@ -277,12 +339,12 @@ pub fn render_video<F: CkFloat>(client: &Client, logits: &Handle, t: usize, sett
             settings.cutout_linear,
         );
     }
-    let words: Vec<u32> = crate::core::buffer::download(client, words);
-    words.into_iter().flat_map(|w| [w as u16, (w >> 16) as u16]).take(total).collect()
+    let words: Vec<u32> = crate::core::buffer::try_download(client, words)?;
+    Ok(words.into_iter().flat_map(|w| [w as u16, (w >> 16) as u16]).take(total).collect())
 }
 
 /// f32 EXR frames `[t, h, w, channels]` of `output` from `[t, H, W, 4]` logits: one download.
-pub fn render_exr<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> Vec<f32> {
+pub fn render_exr<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settings: &RenderSettings, output: RenderOutput) -> CkResult<Vec<f32>> {
     let (h, w) = settings.padded_hw;
     let (oh, ow) = settings.native_hw;
     let channels = output.channels(true);
@@ -313,5 +375,5 @@ pub fn render_exr<F: CkFloat>(client: &Client, logits: &Handle, t: usize, settin
             output.code(),
         );
     }
-    crate::core::buffer::download(client, out)
+    crate::core::buffer::try_download(client, out)
 }

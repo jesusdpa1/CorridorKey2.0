@@ -14,10 +14,20 @@ its logic:
 The product's other roundings stay, being part of its logic: batons to float16 after the Hann
 blend, carried hints and hint quality to bf16.
 
-Writes `frames/NNNN.png`, `<output>.f32` (`[T, h, w, C]` as written: BGR / BGRA / alpha) and
+Writes `frames/NNNN.png`, `frames_rgb8.u8` (the same frames, raw RGB), `<output>.f32` (`[T, h, w, C]` as written: BGR / BGRA / alpha) and
 `meta.json`.
 
-usage: pipeline_reference.py <out_dir>
+With `--exr-linear` (needs `uv run --with OpenEXR`): the frames are scene-linear EXR (the portrait's linear values × 1.6, so
+highlights go above 1) keyed with `frame_dir_linear`, writing `frames/NNNN.exr` and
+`frames_rgbf32.f32` (`[T, h, w, 3]` float RGB) instead of the PNG and byte files.
+
+With `--hints`: also a first-frame hint (`hint_first.png`, 8-bit, alpha channel holding the matte)
+and a hint frame directory (`hints/NNNN.png`, 8-bit RGB mattes the product turns to gray), passed
+as `initial_hint_path` / `hint_video_path`; their values as read by the product are written to
+`hint_first.f32` (`[h, w]`) and `hints.f32` (`[T, h, w]`). The mattes are rough green-difference
+keys of the frames, enough to exercise every hint path.
+
+usage: pipeline_reference.py <out_dir> [--exr-linear] [--hints]
 """
 
 from __future__ import annotations
@@ -27,9 +37,13 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
-import numpy as np
-import torch
+import os
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -59,6 +73,44 @@ def preprocess_frame_dir_path_f32(path: str, meta: dict, *, need_model: bool):
     return model_t, display_t, display_t
 
 
+def rough_matte(frame_bgr: np.ndarray) -> np.ndarray:
+    """A soft green-difference key, uint8."""
+    f = frame_bgr.astype(np.float32)
+    spill = f[..., 1] - np.maximum(f[..., 0], f[..., 2])
+    alpha = np.clip(1.0 - spill / 60.0, 0.0, 1.0)
+    return (cv2.GaussianBlur(alpha, (0, 0), 3.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def write_hints(out: Path, frames_bgr: list[np.ndarray]) -> tuple[str, str]:
+    """Writes the hint inputs and the values the product reads from them (see the module docs)."""
+    mattes = [rough_matte(f) for f in frames_bgr]
+    first = out / "hint_first.png"
+    # BGRA with the matte in alpha and noise in B: `read_hint_image` must pick alpha
+    noise = np.random.default_rng(1).integers(0, 256, mattes[0].shape, dtype=np.uint8)
+    cv2.imwrite(str(first), np.dstack([noise, noise, noise, mattes[0]]))
+    hint_dir = out / "hints"
+    hint_dir.mkdir(exist_ok=True)
+    for i, m in enumerate(mattes):
+        # Unequal channels, so the gray conversion matters
+        bgr = np.dstack([m // 2, m, np.minimum(m.astype(np.uint16) + 20, 255).astype(np.uint8)])
+        cv2.imwrite(str(hint_dir / f"{i:04d}.png"), bgr)
+    video_io.read_hint_image(first).astype(np.float32).tofile(out / "hint_first.f32")
+    meta = {"shape_hw": frames_bgr[0].shape[:2], "model_native_hw": frames_bgr[0].shape[:2]}
+    hints = [video_io.preprocess_hint_frame(cv2.imread(str(p), cv2.IMREAD_UNCHANGED), meta)[0].float().numpy()
+             for p in sorted(hint_dir.glob("*.png"))]
+    np.stack(hints).astype(np.float32).tofile(out / "hints.f32")
+    return str(first), str(hint_dir)
+
+
+def read_exr_rgb(path) -> np.ndarray:
+    """`video_io.read_image_rgb` for EXR through the OpenEXR package: the float RGB values
+    `cv2.imread(IMREAD_UNCHANGED)` + BGR→RGB returns where OpenCV has its EXR codec."""
+    import OpenEXR
+
+    with OpenEXR.File(str(path)) as f:
+        return np.asarray(f.channels()["RGB"].pixels, dtype=np.float32)
+
+
 class Collector:
     """Stands in for `ExrSequenceWriter`: keeps every frame handed to it."""
 
@@ -80,11 +132,28 @@ class Collector:
 
 def main() -> None:
     out = Path(sys.argv[1])
+    exr_linear = "--exr-linear" in sys.argv[2:]
+    with_hints = "--hints" in sys.argv[2:]
     frames_dir = out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     portrait = cv2.imread(str(ROOT / "data" / "green_screen_portrait.png"), cv2.IMREAD_COLOR)
-    for i in range(FRAMES):
-        cv2.imwrite(str(frames_dir / f"{i:04d}.png"), np.roll(portrait, 6 * i, axis=1))
+    frames_bgr = [np.roll(portrait, 6 * i, axis=1) for i in range(FRAMES)]
+    if exr_linear:
+        frames_lin = [(cu.srgb_to_linear(f.astype(np.float32) / 255.0) * 1.6).astype(np.float32) for f in frames_bgr]
+        import OpenEXR  # this OpenCV build has no EXR codec (`OpenEXR: NO`)
+
+        for i, frame in enumerate(frames_lin):
+            rgb = np.ascontiguousarray(frame[..., ::-1])
+            header = {"compression": OpenEXR.ZIP_COMPRESSION, "type": OpenEXR.scanlineimage}
+            with OpenEXR.File(header, {"RGB": rgb}) as f:
+                f.write(str(frames_dir / f"{i:04d}.exr"))
+        video_io.read_image_rgb = read_exr_rgb
+        np.stack([f[..., ::-1] for f in frames_lin]).astype(np.float32).tofile(out / "frames_rgbf32.f32")
+    else:
+        for i, frame in enumerate(frames_bgr):
+            cv2.imwrite(str(frames_dir / f"{i:04d}.png"), frame)
+        # The same frames as raw RGB bytes ([T, h, w, 3] uint8), the Rust tests' input
+        np.stack([f[..., ::-1] for f in frames_bgr]).tofile(out / "frames_rgb8.u8")
 
     torch.autocast = lambda *a, **k: contextlib.nullcontext()  # fp32 reference
     video_io.preprocess_frame_dir_path = preprocess_frame_dir_path_f32
@@ -95,10 +164,13 @@ def main() -> None:
     model = load_model(RuntimePaths.from_package(ROOT), "cuda")
     cfg = InferenceConfig(
         hann_chunk=CHUNK, hann_stride=STRIDE, outputs=set(OUTPUTS), output_format="exr", exr_dtype="float",
-        temp_dir=out / "tmp",
+        temp_dir=out / "tmp", frame_dir_linear=exr_linear,
     )
+    initial_hint_path = hint_video_path = None
+    if with_hints:
+        initial_hint_path, hint_video_path = write_hints(out, frames_bgr)
     runtime.run_inference(model, str(frames_dir), str(out / "unused"), cfg, WriterConfig(),
-                          initial_hint_path=None, hint_video_path=None)
+                          initial_hint_path=initial_hint_path, hint_video_path=hint_video_path)
 
     shapes = {}
     for name, frames in Collector.frames.items():
@@ -106,7 +178,7 @@ def main() -> None:
         arr = arr[..., None] if arr.ndim == 3 else arr
         arr.tofile(out / f"{name}.f32")
         shapes[name] = list(arr.shape)
-    meta = {"frames": FRAMES, "chunk": CHUNK, "stride": STRIDE, "shapes": shapes,
+    meta = {"frames": FRAMES, "exr_linear": exr_linear, "hints": with_hints, "chunk": CHUNK, "stride": STRIDE, "shapes": shapes,
             "carry_hint_quality": cfg.carry_hint_quality, "despill": cfg.despill_strength}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta))

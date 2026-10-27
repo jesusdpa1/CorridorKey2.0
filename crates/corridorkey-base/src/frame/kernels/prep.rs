@@ -19,7 +19,7 @@ fn byte_at(words: &[u32], i: u32) -> u32 {
 /// cv2's `BORDER_REFLECT_101` source index of padded coordinate `p` for an image of `size`
 /// starting at `start` (`gfedcb|abcdefgh|gfedcba`); the pad must be smaller than the image.
 #[cube]
-fn reflect_101(p: u32, start: u32, size: u32) -> u32 {
+pub fn reflect_101(p: u32, start: u32, size: u32) -> u32 {
     // Signed arithmetic in i32: the padded coordinate may sit before the image.
     let s = p as i32 - start as i32;
     let n = size as i32;
@@ -69,6 +69,59 @@ pub fn frame_views_kernel<F: CkFloat, N: Size>(
             foundation[i as usize] = select_many(sdr.greater_than(&one), one, select_many(sdr.less_than(&zero), zero, sdr));
         } else {
             foundation[i as usize] = v;
+        }
+    }
+}
+
+/// [`frame_views_kernel`] from `[T, h0, w0, 3]` float RGB (EXR frame directories,
+/// `video_io._read_frame_dir_views`). With `linear_input` the values are scene-linear: `linear =
+/// adjust(raw)` and the backbones see `clip(linear_to_srgb(max(linear, 0)), 0, 1)`. Otherwise they
+/// are display values: `display = clip(raw, 0, 1)`, then as from bytes.
+#[cube(launch)]
+pub fn frame_views_f32_kernel<F: CkFloat, N: Size>(
+    frames: &[f32],
+    model: &mut [Vector<F, N>],
+    foundation: &mut [Vector<F, N>],
+    total: u32,
+    h: u32,
+    w: u32,
+    h0: u32,
+    w0: u32,
+    top: u32,
+    left: u32,
+    scale: F,
+    offset: F,
+    inv_knee: F,
+    inv_denom: F,
+    #[comptime] linear_input: bool,
+    #[comptime] adjusted: bool,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < total {
+        let c = i % 3u32;
+        let x = (i / 3u32) % w;
+        let y = (i / (3u32 * w)) % h;
+        let t = i / (3u32 * w * h);
+        let sy = reflect_101(y, top, h0);
+        let sx = reflect_101(x, left, w0);
+        let raw = frames[(((t * h0 + sy) * w0 + sx) * 3u32 + c) as usize];
+        let zero = Vector::<F, N>::new(F::new(0.0f32));
+        let one = Vector::<F, N>::new(F::new(1.0f32));
+        if comptime!(linear_input) {
+            let linear = Vector::<F, N>::new(F::cast_from(raw)) * Vector::new(scale) + Vector::new(offset);
+            model[i as usize] = linear_to_asinh::<F, N>(linear, inv_knee, inv_denom);
+            let sdr = linear_to_srgb::<F, N>(select_many(linear.less_than(&zero), zero, linear));
+            foundation[i as usize] = select_many(sdr.greater_than(&one), one, select_many(sdr.less_than(&zero), zero, sdr));
+        } else {
+            let display = Vector::<F, N>::new(F::cast_from(f32::min(f32::max(raw, 0.0f32), 1.0f32)));
+            let linear = srgb_to_linear::<F, N>(display) * Vector::new(scale) + Vector::new(offset);
+            model[i as usize] = linear_to_asinh::<F, N>(linear, inv_knee, inv_denom);
+            if comptime!(adjusted) {
+                let sdr = linear_to_srgb::<F, N>(select_many(linear.less_than(&zero), zero, linear));
+                foundation[i as usize] = select_many(sdr.greater_than(&one), one, select_many(sdr.less_than(&zero), zero, sdr));
+            } else {
+                foundation[i as usize] = display;
+            }
         }
     }
 }

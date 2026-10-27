@@ -29,6 +29,21 @@ pub struct EncoderConfig {
     pub threads: u32,
 }
 
+impl Default for EncoderConfig {
+    /// `infer.py`'s defaults.
+    fn default() -> Self {
+        Self {
+            ffmpeg: "ffmpeg".into(),
+            codec: "libx264".into(),
+            crf: 12,
+            preset: "medium".into(),
+            pix_fmt: "yuv444p10le".into(),
+            bitrate: None,
+            threads: 2,
+        }
+    }
+}
+
 /// The file-name suffix of an output (`suffix` in `run_inference`).
 pub fn output_suffix(output: RenderOutput, despill: f64) -> String {
     match output {

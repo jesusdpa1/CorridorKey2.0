@@ -10,7 +10,10 @@
 //! the work was done (SIGSEGV in `libnvidia-glvkspirv`, "corrupted double-linked list" in
 //! `libnvidia-gpucomp`, with the main thread inside `exit()`). Every device a client is made for is
 //! recorded, and an exit handler, registered after each device is opened (so it runs before the
-//! handlers of the libraries and layers loaded until then), shuts them down: [`shutdown_devices`].
+//! handlers of the libraries and layers loaded until then), deals with them. With glibc it ends the
+//! process there with its exit status (`_exit`), before any teardown: shutting the devices down
+//! raced the driver too, and autotuners keep clients alive so it could not finish anyway. Elsewhere
+//! it shuts them down ([`shutdown_devices`]), waiting at most 2 s.
 
 use std::sync::Mutex;
 
@@ -56,12 +59,76 @@ static OPENED: Mutex<Vec<Device>> = Mutex::new(Vec::new());
 #[cfg(not(target_arch = "wasm32"))]
 unsafe extern "C" {
     /// The C library's exit-handler registration (handlers run in reverse order of registration).
+    #[cfg_attr(all(target_os = "linux", target_env = "gnu"), allow(dead_code))]
     fn atexit(handler: extern "C" fn()) -> std::ffi::c_int;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+// glibc's exit-handler registration that also hands the handler the exit status.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn on_exit(handler: extern "C" fn(std::ffi::c_int, *mut std::ffi::c_void), arg: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn fflush(stream: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+
+/// How long the exit handler waits for the devices to shut down. A runner only stops once every
+/// client is gone, and autotuners keep their tunable sets (which can hold a client) in statics
+/// nothing clears: after a run that autotuned, CubeCL's own join would wait its full 30 s.
+#[cfg(all(not(target_arch = "wasm32"), not(all(target_os = "linux", target_env = "gnu"))))]
+const EXIT_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Shuts the devices down, waiting at most [`EXIT_SHUTDOWN_WAIT`]; whether they stopped in time.
+#[cfg(all(not(target_arch = "wasm32"), not(all(target_os = "linux", target_env = "gnu"))))]
+fn shutdown_within_wait() -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("corridorkey-shutdown".into()).spawn(move || {
+        shutdown_devices();
+        let _ = tx.send(());
+    });
+    spawned.is_ok() && rx.recv_timeout(EXIT_SHUTDOWN_WAIT).is_ok()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(all(target_os = "linux", target_env = "gnu"))))]
 extern "C" fn shutdown_at_exit() {
-    shutdown_devices();
+    shutdown_within_wait();
+}
+
+/// With glibc the handler knows the exit status, so the process ends here with it: stdio flushed,
+/// then `_exit`, without shutting the devices down or running the remaining C exit handlers and
+/// library destructors. Both race NVIDIA's driver threads, which keep compiling and freeing on their
+/// own: library teardown crashed at exit (SIGSEGV in `libnvidia-glvkspirv`), and so did a device
+/// shutdown here (heap corruption in a `libnvidia-gpucomp` thread while CubeCL tore down the wgpu
+/// device's services, a Python process that keyed on wgpu, 2026-10-27, 3 exits in 5). Whatever
+/// hosts this library (the command line, Python) has finalized by then.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" fn shutdown_on_exit(status: std::ffi::c_int, _arg: *mut std::ffi::c_void) {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: flushes every C stream (null means all), then ends the process with the status `exit`
+    // was given; nothing is left to unwind
+    unsafe {
+        fflush(std::ptr::null_mut());
+        c_exit_now(status)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn c_exit_now(status: std::ffi::c_int) -> !;
+}
+
+/// Ends the process now, after flushing stdout and stderr: no exit handlers, no library teardown.
+/// For a program whose work is done (outputs written and closed): the GPU drivers' teardown
+/// racing their own worker threads is what crashed or hung at exit, and the device shutdown
+/// above cannot finish while autotuners hold clients.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` takes a status and never returns; nothing is left to unwind
+    unsafe { c_exit_now(code) }
 }
 
 /// Records `device`, newly opened, and registers [`shutdown_devices`] to run at exit. Called after
@@ -79,7 +146,11 @@ fn opened(device: &Device) {
     drop(devices);
     // SAFETY: registers a plain `extern "C"` function; failure (no slot left) only means the
     // device is not shut down at exit, as before
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        on_exit(shutdown_on_exit, std::ptr::null_mut());
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(all(target_os = "linux", target_env = "gnu"))))]
     unsafe {
         atexit(shutdown_at_exit);
     }

@@ -23,6 +23,15 @@ pub struct VideoInfo {
     pub frames: usize,
 }
 
+/// ffprobe next to `ffmpeg` when that is a path, else `ffprobe` from `PATH`.
+pub fn ffprobe_for(ffmpeg: &str) -> String {
+    if ffmpeg.contains('/') {
+        Path::new(ffmpeg).with_file_name("ffprobe").display().to_string()
+    } else {
+        "ffprobe".into()
+    }
+}
+
 /// Probes the first video stream with ffprobe. The frame count is the container's `nb_frames`,
 /// else `duration × fps` (OpenCV's `CAP_PROP_FRAME_COUNT` reads the same metadata).
 pub fn probe(ffprobe: &str, path: &Path) -> Result<VideoInfo> {

@@ -4,7 +4,9 @@ members = [
     "crates/corridorkey-core",
     "crates/corridorkey-base",
     "crates/corridorkey-ml",
+    "crates/corridorkey-io",
     "crates/corridorkey-cli",
+    "crates/corridorkey-py",
 ]
 
 [workspace.package]
@@ -16,19 +18,23 @@ license = "MIT OR Apache-2.0"
 corridorkey-core = { path = "crates/corridorkey-core" }
 corridorkey-base = { path = "crates/corridorkey-base" }
 corridorkey-ml = { path = "crates/corridorkey-ml" }
+corridorkey-io = { path = "crates/corridorkey-io" }
 
 # Compute & Tensors
 # `persistence`: autotune results (and kernel caches) survive the process, in `~/.cache/cubecl`.
 # Without it every launch re-tunes every matmul / attention shape (65–91 s cold on the RTX 2070).
-cubecl = { version = "0.11.0", default-features = false, features = ["std", "stdlib", "persistence"] }
-burn-tensor = { version = "0.22.0", default-features = false, features = ["std", "autotune", "extension"] }
-burn-cubecl = { version = "0.22.0", default-features = false, features = ["std", "autotune"] }
+cubecl = { version = "0.11.3", default-features = false, features = ["std", "stdlib", "persistence"] }
+burn-tensor = { version = "0.22.1", default-features = false, features = ["std", "autotune", "extension"] }
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["std", "autotune"] }
 # For naming attention strategies explicitly (autotune candidates); the version Burn 0.22 uses.
 cubek-attention = { version = "0.3.1", default-features = false }
 safetensors = "0.8.0"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
-# Frame-directory input and EXR output of the command line
+# GPU memory (free memory for the window size, peak memory in benchmarks): NVIDIA's management
+# library, loaded at run time (absent on other vendors)
+nvml-wrapper = "0.13.0"
+# Frame-directory input and EXR output (corridorkey-io)
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 exr = "1.74.2"
 
@@ -41,6 +47,10 @@ base64 = "0.22.1"
 hex = "0.4.3"
 anyhow = "1.0.104"
 tracing-subscriber = "0.3.23"
+
+# Python bindings (corridorkey-py)
+pyo3 = "0.30.1"
+numpy = "0.30.0"
 
 # Utilities
 serde = { version = "1.0.229", features = ["derive"] }

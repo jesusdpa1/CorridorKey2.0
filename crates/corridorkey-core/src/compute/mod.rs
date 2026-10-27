@@ -20,6 +20,8 @@ pub mod tune;
 
 pub use crate::device::{ComputeError, ComputeTarget, RUNTIME_ENV};
 pub use target::{open_device, shutdown_devices};
+#[cfg(not(target_arch = "wasm32"))]
+pub use target::exit_now;
 pub use limits::{device_elements, MAX_DEVICE_ELEMENTS};
 pub use pinning::{pin_tuned_choices, tuned_choices_pinned, PinnedChoices};
 pub use launch::{LaunchGeometry, column_position, pixel_row_position, row_position};

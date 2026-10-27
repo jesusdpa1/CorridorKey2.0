@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use burn_tensor::Tensor;
 use corridorkey_base::core::CkFloat;
 use corridorkey_base::core::buffer::{empty, zeros};
-use corridorkey_base::frame::{BackboneInputs, RenderOutput, RenderSettings, bilinear_resize, frame_views, render_exr, render_video, upload_frames};
+use corridorkey_base::frame::{BackboneInputs, RenderOutput, RenderSettings, bilinear_resize, render_exr, render_video, upload_frame_views};
+pub use corridorkey_base::frame::FrameData;
 use corridorkey_core::compute::LaunchGeometry;
 use corridorkey_core::{CkError, CkResult, FrameMeta, WindowSchedule};
 use cubecl::prelude::*;
@@ -29,7 +30,7 @@ use crate::models::foundations::{CRadio, MogeEncoder, RvmSmall};
 use crate::models::stage1::Stage1;
 use crate::models::stage2::Stage2;
 use crate::runtime::{MlContext, elem_dtype, into_contiguous_cube};
-use kernels::{accumulate_kernel, assemble_rgb_hint_kernel, carry_hint_kernel, copy_kernel, finalize_baton_kernel};
+use kernels::{accumulate_kernel, assemble_rgb_hint_kernel, carry_hint_kernel, copy_kernel, finalize_baton_kernel, pad_hint_kernel};
 
 /// Frames per RVM chunk in the continuous pre-pass (`min(hann_chunk, 8)` in the product).
 pub const RVM_CHUNK: usize = 8;
@@ -59,10 +60,66 @@ impl ModelPaths {
     }
 }
 
-/// Decoded frames of a clip, 8-bit RGB `[count, h, w, 3]` at the native size.
+/// Decoded frames of a clip, RGB `[count, h, w, 3]` at the native size.
 pub trait FrameReader {
-    /// Frames `start .. start + count` (the driver reads overlapping ranges in order).
+    /// Frames `start .. start + count` as 8-bit RGB (the driver reads overlapping ranges in order).
     fn read_rgb8(&mut self, start: usize, count: usize) -> CkResult<Vec<u8>>;
+
+    /// Frames `start .. start + count` in the reader's own form: 8-bit unless overridden (float
+    /// sources such as EXR frames hand over [`FrameData::RgbF32`]). What the driver calls.
+    fn read(&mut self, start: usize, count: usize) -> CkResult<FrameData> {
+        Ok(FrameData::Rgb8(self.read_rgb8(start, count)?))
+    }
+}
+
+/// Hints of a clip's frames at the native size, values in [0, 1].
+pub trait HintReader {
+    /// Hints of frames `start .. start + count`: `[count, h0, w0]` (read in order, like frames).
+    fn read_hints(&mut self, start: usize, count: usize) -> CkResult<Vec<f32>>;
+}
+
+/// External hints of a run (`--hint-first-frame`, `--hint-video`) and the quality (trust) Stage 1
+/// is told for each. Carried hints override the video's; the first-frame hint overrides both on
+/// frame 0 of the first window (`hann_stage1_stream`).
+#[derive(Default)]
+pub struct Hints<'a> {
+    /// Hint of frame 0, `[h0, w0]`.
+    pub first_frame: Option<Vec<f32>>,
+    pub first_frame_quality: f64,
+    /// Hints of every frame.
+    pub video: Option<&'a mut dyn HintReader>,
+    pub video_quality: f64,
+}
+
+/// Pads `count` native-size hints (`values`, `[count, h0, w0]`) into `dst` from frame `dst_frame`.
+fn pad_hints<F: CkFloat>(client: &Client, values: &[f32], count: usize, meta: &FrameMeta, dst: &Handle, dst_frame: usize, round: bool) -> CkResult<()> {
+    let (h0, w0) = meta.native_hw;
+    let (h, w) = meta.shape_hw;
+    if values.len() != count * h0 * w0 {
+        return Err(CkError::Shape(format!("{} hint values for {count} frames of {h0}x{w0}", values.len())));
+    }
+    let src = corridorkey_base::core::buffer::upload(client, values);
+    let total = count * h * w;
+    let geom = LaunchGeometry::elementwise(client, total);
+    unsafe {
+        pad_hint_kernel::launch::<F>(
+            client,
+            geom.cube_count,
+            geom.cube_dim,
+            BufferArg::from_raw_parts(src, values.len()),
+            BufferArg::from_raw_parts(dst.clone(), (dst_frame + count) * h * w),
+            total as u32,
+            h as u32,
+            w as u32,
+            h0 as u32,
+            w0 as u32,
+            meta.pad.top as u32,
+            meta.pad.left as u32,
+            (dst_frame * h * w) as u32,
+            round,
+        );
+    }
+    Ok(())
 }
 
 /// Rendered frames of one output: `[frames, h, w, channels]`.
@@ -136,13 +193,26 @@ impl Keyer {
         })
     }
 
-    /// Keys a clip: RVM over all frames, then Stage 1 windows with Hann-blended batons and carried
-    /// hints, Stage 2 and rendering as frames complete.
+    /// Keys a clip without external hints: see [`Keyer::run_with_hints`].
     pub fn run<F: CkFloat>(
         &self,
         ctx: &MlContext,
         meta: &FrameMeta,
         reader: &mut dyn FrameReader,
+        sink: &mut dyn FrameSink,
+        cfg: &PipelineConfig,
+    ) -> CkResult<()> {
+        self.run_with_hints::<F>(ctx, meta, reader, &mut Hints::default(), sink, cfg)
+    }
+
+    /// Keys a clip: RVM over all frames, then Stage 1 windows with Hann-blended batons, external
+    /// and carried hints, Stage 2 and rendering as frames complete.
+    pub fn run_with_hints<F: CkFloat>(
+        &self,
+        ctx: &MlContext,
+        meta: &FrameMeta,
+        reader: &mut dyn FrameReader,
+        hints: &mut Hints<'_>,
         sink: &mut dyn FrameSink,
         cfg: &PipelineConfig,
     ) -> CkResult<()> {
@@ -169,7 +239,7 @@ impl Keyer {
         let rvm_chunk = cfg.chunk.clamp(1, RVM_CHUNK);
         for t0 in (0..total).step_by(rvm_chunk) {
             let n = rvm_chunk.min(total - t0);
-            let views = frame_views::<F>(client, &upload_frames(client, &reader.read_rgb8(t0, n)?), n, meta, adjust)?;
+            let views = upload_frame_views::<F>(client, &reader.read(t0, n)?, n, meta, adjust)?;
             let rvm_in = bilinear_resize::<F>(client, &views.foundation, (n, h, w, 3), (h4, w4), true);
             let (feats, next) = self.rvm.forward::<F>(ctx, ctx.tensor_from_handle(rvm_in, [n, h4, w4, 3], dt), state)?;
             state = next;
@@ -187,7 +257,7 @@ impl Keyer {
         for (wi, window) in windows.iter().enumerate() {
             let (t0, t1) = (window.frames.start, window.frames.end);
             let tc = t1 - t0;
-            let views = frame_views::<F>(client, &upload_frames(client, &reader.read_rgb8(t0, tc)?), tc, meta, adjust)?;
+            let views = upload_frame_views::<F>(client, &reader.read(t0, tc)?, tc, meta, adjust)?;
             let inputs = BackboneInputs::from_views::<F>(client, &views);
             let cradio = self.cradio.forward::<F>(ctx, ctx.tensor_from_handle(inputs.cradio, [tc, h4, w4, 3], dt))?;
             let (mh, mw) = inputs.moge_hw;
@@ -199,16 +269,27 @@ impl Keyer {
             let vfm_c = vfm.dims()[3];
             let vfm = vfm.reshape([1, tc, h64, w64, vfm_c]);
 
-            // Hints of this window: carried from the previous window's aux where available.
+            // Hints of this window: the hint video's, overridden by those carried from the previous
+            // window's aux, then by the first-frame hint on frame 0.
             let hint = zeros::<F>(client, tc * frame_px);
             let mut hq = vec![0.0f64; tc];
             let mut present = false;
+            if let Some(video) = hints.video.as_deref_mut() {
+                pad_hints::<F>(client, &video.read_hints(t0, tc)?, tc, meta, &hint, 0, cfg.product_rounding)?;
+                hq.fill(quality(hints.video_quality));
+                present = true;
+            }
             for j in 0..tc {
                 if let Some(c) = carry.get(&(t0 + j)) {
                     copy::<F>(client, c, &hint, frame_px, 0, j * frame_px);
                     hq[j] = quality(cfg.carry_hint_quality);
                     present = true;
                 }
+            }
+            if let (Some(first), 0) = (&hints.first_frame, t0) {
+                pad_hints::<F>(client, first, 1, meta, &hint, 0, cfg.product_rounding)?;
+                hq[0] = quality(hints.first_frame_quality);
+                present = true;
             }
             if !present {
                 hq.fill(-1.0);
@@ -330,9 +411,9 @@ impl Keyer {
         let logits = into_contiguous_cube(logits)?.handle;
         for &output in &cfg.outputs {
             let data = if cfg.exr {
-                RenderedFrames::Exr(render_exr::<F>(client, &logits, n, render, output))
+                RenderedFrames::Exr(render_exr::<F>(client, &logits, n, render, output)?)
             } else {
-                RenderedFrames::Video(render_video::<F>(client, &logits, n, render, output))
+                RenderedFrames::Video(render_video::<F>(client, &logits, n, render, output)?)
             };
             sink.write(output, frames[0], n, data)?;
         }

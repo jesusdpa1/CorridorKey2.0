@@ -61,7 +61,7 @@ impl ComputeTask for Render {
                 }
                 let file = format!("video_{name}{}.u16", if linear { "_linear" } else { "" });
                 let want: Vec<u16> = read(&file).chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-                let got = render_video::<f32>(&client, &handle, t, &settings, out);
+                let got = render_video::<f32>(&client, &handle, t, &settings, out).unwrap();
                 assert_eq!(got.len(), want.len(), "{file}");
                 let same = got.iter().zip(&want).filter(|(g, w)| g == w).count();
                 if std::env::var("RENDER_DEBUG").is_ok() {
@@ -81,7 +81,7 @@ impl ComputeTask for Render {
         for (out, name) in OUTPUTS {
             let file = format!("exr_{name}.f32");
             let want: Vec<f32> = read(&file).chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-            let got = render_exr::<f32>(&client, &handle, t, &settings, out);
+            let got = render_exr::<f32>(&client, &handle, t, &settings, out).unwrap();
             assert_eq!(got.len(), want.len(), "{file}");
             let rel = got.iter().zip(&want).fold(0f64, |m, (&g, &w)| m.max((g as f64 - w as f64).abs() / (w.abs() as f64).max(1.0)));
             let peak = want.iter().fold(0f64, |m, &w| m.max(w.abs() as f64));
