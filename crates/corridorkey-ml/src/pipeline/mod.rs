@@ -274,8 +274,10 @@ impl Keyer {
                 cradio_parts.push(self.cradio.forward::<F>(ctx, cradio_in.clone().narrow(0, s, n))?);
                 moge_parts.push(self.moge.forward::<F>(ctx, moge_in.clone().narrow(0, s, n))?);
             }
-            let cradio = Tensor::cat(cradio_parts, 0);
-            let moge = Tensor::cat(moge_parts, 0);
+            // One part (the usual case): used as is, no concatenated copy
+            let join = |mut parts: Vec<Tensor<4>>| if parts.len() == 1 { parts.pop().expect("one part") } else { Tensor::cat(parts, 0) };
+            let cradio = join(cradio_parts);
+            let moge = join(moge_parts);
             let rvm_w = empty::<F>(client, tc * p64 * rvm_dim);
             copy::<F>(client, &rvm_all, &rvm_w, tc * p64 * rvm_dim, t0 * p64 * rvm_dim, 0);
             let rvm = ctx.tensor_from_handle::<4>(rvm_w, [tc, h64, w64, rvm_dim], dt);

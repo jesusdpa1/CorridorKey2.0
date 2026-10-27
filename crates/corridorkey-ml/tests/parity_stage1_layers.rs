@@ -33,6 +33,7 @@ fn diff_stats(got: &[f32], want: &[f32]) -> (f64, f64) {
 }
 
 #[test]
+#[ignore = "diagnostic: needs a one-off dump of Stage 1 intermediates (fuse_tokens_bthwc.f32, ...) that no reference script writes; parity_stage1 covers Stage 1 end to end"]
 fn test_stage1_layer_by_layer() {
     let dir = Path::new("/tmp/corridorkey-parity-stage1");
     if !dir.join("stage1_meta.json").exists() {
