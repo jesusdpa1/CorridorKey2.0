@@ -21,6 +21,8 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
 environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
+The [Rust engine](#rust-engine-corridorkey-rs) also runs on older NVIDIA GPUs (it was
+developed on an RTX 2070, Turing) and, through WGPU, on other vendors' GPUs.
 Exact versions are locked in `uv.lock` (torch 2.14.1, torchvision 0.29.1, CUDA 13.0).
 
 From the repository root, install the environment with [uv](https://docs.astral.sh/uv/)
@@ -71,7 +73,7 @@ and [Burn](https://github.com/tracel-ai/burn): the three foundation models, Stag
 Stage 2, Hann blending, hints and output rendering, with every frame kept on the GPU
 from decoding to the finished outputs. It writes the same files as `infer.py`, matching
 its fp32 output to about 1e-6, and on an 8 GB laptop GPU it is faster than PyTorch's
-fastest mode and needs about half its memory (see the pull request benchmark).
+fastest mode and needs about half its memory (charts below).
 
 One build covers NVIDIA (CUDA) and any GPU with Vulkan, Metal or DirectX 12 (WGPU);
 pick one per run with `--runtime cuda|wgpu` or `CORRIDORKEY_RUNTIME`. Precision is f16
@@ -299,7 +301,9 @@ run and saved in the settings log. To set them yourself:
 --hann_chunk 80 --hann_stride 40
 ```
 
-Passing `--hann_chunk` or `--low_vram` turns automatic selection off.
+Passing `--hann_chunk` or `--low_vram` turns automatic selection off. (The Rust
+engine keeps choosing automatically unless `--hann-chunk` or `--hann-stride` is given;
+see [Long Clips And Low VRAM](#long-clips-and-low-vram).)
 
 What the settings mean:
 
@@ -492,7 +496,29 @@ remain good, with somewhat less frame-to-frame consistency than larger windows.
 
 These come from measurements on synthetic test clips; other software using the
 GPU reduces what is available. If you hit a CUDA out-of-memory error, pass
-`--low_vram` with a smaller `--hann_chunk` yourself.
+`--low_vram` with a smaller `--hann_chunk` yourself. (On an 8 GB RTX 2070 laptop GPU,
+the 1080p choice above, 8/4 low-VRAM, ran out of memory; 4/2 low-VRAM worked.)
+
+With the Rust engine (`corridorkey infer`), the window comes from the engine's own
+memory model, fitted from measurements of its peak memory, plus the same safety margin.
+A window you set with `--hann-chunk` is refused before the run starts if the model says
+it will not fit, because running out of GPU memory can corrupt mattes silently rather
+than fail. What it picks (f16, estimated from the model; only the 8 GB row was measured):
+
+| GPU memory | 720p | 1080p | 1440p | 4K |
+|---|---|---|---|---|
+| 6 GB | 8/4 | 2/1 | 1/1 | not enough memory |
+| 8 GB | 16/8 | 4/2 | 2/1 | not enough memory |
+| 12 GB | 32/16 | 8/4 | 8/4 | 2/1 |
+| 16 GB | 48/24 | 16/8 | 8/4 | 4/2 |
+| 24 GB | 80/40 | 32/16 | 16/8 | 8/4 |
+
+The Python runtime reaches larger windows on small cards by splitting Stage 1's work in
+its low-VRAM mode, at some cost in speed; the Rust engine has no equivalent yet. It
+accepts `--low-vram`, which runs the foundation models a few frames at a time with
+identical results, but that saves little memory there and does not change the window it
+picks. The other `--low-vram-*` tuning options apply to the Python runtime only.
+`corridorkey bench --sweep` measures the engine on a given GPU.
 
 The normal path streams video and does not intentionally hold an entire long
 clip in RAM. To force low-VRAM mode yourself, add:
